@@ -104,7 +104,7 @@ These operations require the following:
 	rotateAWSCredsCmd.Flags().BoolVar(&ops.describeSecretsCli, "describe-secrets", false, "Print AWS CredentialRequests ref'd secrets info relecant to cred rotation, and exit")
 	rotateAWSCredsCmd.Flags().BoolVar(&ops.saveSecretKeyToFile, "save-keys", false, "Save 'newly created' secret access key contents stdout output during execution")
 	rotateAWSCredsCmd.Flags().StringVar(&ops.osdManagedAdminUsername, "admin-username", "", "The admin username to use for generating access keys. Must be in the format of `osdManagedAdmin*`. If not specified, this is inferred from the account CR.")
-	rotateAWSCredsCmd.Flags().IntVarP(&ops.verboseLevel, "verbose", "v", 1, "debug=4, (default)info=3, warn=2, error=1")
+	rotateAWSCredsCmd.Flags().IntVarP(&ops.verboseLevel, "verbose", "v", 3, "debug=4, (default)info=3, warn=2, error=1")
 	// Reason is required for elevated bacplane-admin impersonated requests
 	_ = rotateAWSCredsCmd.MarkFlagRequired("reason")
 
@@ -199,6 +199,7 @@ func (o *rotateCredOptions) preRunCliChecks(cmd *cobra.Command, args []string) e
 		return fmt.Errorf("failed to build logger: %s", err)
 	}
 	o.log = logger
+
 	if !o.updateCcsCredsCli && !o.updateMgmtCredsCli && !o.describeKeysCli && !o.describeSecretsCli {
 		return cmdutil.UsageErrorf(cmd, "must provide one or more actions: ('--rotate-managed-admin' and/or '--rotate-ccs-admin'), or '--describe-secrets', or '--describe-keys'")
 	}
@@ -208,12 +209,10 @@ func (o *rotateCredOptions) preRunCliChecks(cmd *cobra.Command, args []string) e
 
 	if o.saveSecretKeyToFile {
 		if o.updateCcsCredsCli && fileExists(saveFileCcs) {
-			o.log.Error(o.ctx, "--save-keys provided. '%s' file already present, please move/remove before running.", saveFileCcs)
-			return fmt.Errorf("file '%s' already present, please move/remove before running", saveFileCcs)
+			return fmt.Errorf("--save-keys: file '%s' already present, please move/remove before running", saveFileCcs)
 		}
 		if o.updateMgmtCredsCli && fileExists(saveFileManaged) {
-			o.log.Error(o.ctx, "--save-keys provided. '%s' file already present, please move/remove before running.", saveFileManaged)
-			return fmt.Errorf("file '%s' already present, please move/remove before running", saveFileManaged)
+			return fmt.Errorf("--save-keys: file '%s' already present, please move/remove before running", saveFileManaged)
 		}
 	}
 	return nil
@@ -300,14 +299,18 @@ func (o *rotateCredOptions) run() error {
 		if err != nil {
 			return err
 		}
+		// Return here to avoid mixing rotate and describe commands
 		return nil
 	}
-	if o.updateMgmtCredsCli || o.updateCcsCredsCli {
+
+	// Begin rotate specific operations...
+	if !o.updateMgmtCredsCli && !o.updateCcsCredsCli {
+		// user did not select a rotate operation, this should be caught in pre-run checks
 		return nil
 	}
-	// Make sure user is on correct cluster, etc...
+	// Display cluster info, let user confirm they are on the correct cluster, etc...
 	o.printClusterInfo()
-	fmt.Println("Proceed with Managed Admin AWS credentials rotation?")
+	fmt.Println("Proceed with Managed Admin AWS credentials rotation on this cluster?")
 	if !utils.ConfirmPrompt() {
 		fmt.Println("User quit.")
 		return nil
@@ -333,7 +336,8 @@ func (o *rotateCredOptions) run() error {
 		o.log.Warn(o.ctx, "fetchCredentialsRequests returned err:'%s'\n", err)
 		return err
 	}
-	fmt.Printf("Script Run Completed Successfully.\nOptions --describe-keys, --describe-secrets can be used to provide additional info/status\n")
+	fmt.Printf("\nOptions --describe-keys, --describe-secrets can be used to provide additional info/status\n")
+	fmt.Printf("Script Run Completed Successfully.\n")
 	return nil
 }
 
@@ -444,15 +448,21 @@ func (o *rotateCredOptions) deleteAWSCredRequestSecrets() error {
 		o.log.Warn(o.ctx, "Error fetching AWS related credentialRequests to delete secrets, err:'%s'\n", err)
 		return err
 	}
-	fmt.Println("AWS CredentialRequest referenced secrets to delete:")
+	fmt.Printf("\nAWS CredentialRequest referenced secrets to be deleted:\n")
 	// Print secrets info for user to review before choosing to continue
 	o.printAWSCredRequestSecrets(&awsCredReqs)
-	fmt.Println("Are you sure you want to continue? (DO NOT CONTINUE IF ANYTHING LOOKS AMISS)")
+	fmt.Println("Please review above credentialRequest Secrets to be deleted.")
+	fmt.Println("(DO NOT CONTINUE IF ANYTHING LOOKS AMISS)")
+	fmt.Println("Are you sure you want to continue?")
 	var userInput string = ""
+	w := tabwriter.NewWriter(os.Stdout, 1, 1, 1, ' ', 0)
 inputLoop:
 	for {
-		fmt.Printf("'Y' = User will be prompted per Secret for deletion.\n'All' = Delete all without interactive prompts\n'N' = Do not continue\n")
-		fmt.Printf("Continue?('y','n','all'):")
+		fmt.Fprintf(w, "'Y'\t- User will be prompted to choose per Secret for deletion.\n")
+		fmt.Fprintf(w, "'N'\t- Do not continue\n")
+		fmt.Fprintf(w, "'all'\t- Delete all without interactive prompts\n")
+		fmt.Fprintf(w, "Continue? ('y','n','all'):")
+		w.Flush()
 
 		_, _ = fmt.Scanln(&userInput)
 		switch strings.ToLower(userInput) {
@@ -466,19 +476,27 @@ inputLoop:
 		case "all":
 			break inputLoop
 		default:
-			fmt.Println("Invalid input. Expecting (y)es or (N)o or 'ALL'")
+			fmt.Println("Invalid input. Expecting (y)es or (N)o or 'all'")
 		}
 	}
 	if userInput == "y" || userInput == "all" {
-		for _, cr := range awsCredReqs {
+		var idx = 0
+		for sidx, cr := range awsCredReqs {
+			idx = sidx + 1
 			secret, err := o.clusterClientset.CoreV1().Secrets(cr.Spec.SecretRef.Namespace).Get(context.TODO(), cr.Spec.SecretRef.Name, metav1.GetOptions{})
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error getting secret:'%s', skipping\n", secret.Name)
 				continue
 			}
-			fmt.Printf("\nCR:'%s', Secret:'%s', namespace:'%s', created:'%v'\nDelete Secret?\n", cr.Name, secret.Name, secret.Namespace, secret.CreationTimestamp)
+			fmt.Fprintf(w, "\nSecret (%d/%d):\n", idx, len(awsCredReqs))
+			fmt.Fprintf(w, "\tCredentialRequest:\t'%s'\n", cr.Name)
+			fmt.Fprintf(w, "\tSecret:\t'%s'\n", secret.Name)
+			fmt.Fprintf(w, "\tSecret Namespace:\t'%s'\n", secret.Namespace)
+			fmt.Fprintf(w, "\tCreate:\t'%v'\n", secret.CreationTimestamp)
+			w.Flush()
+			fmt.Printf("Delete Secret ('%s'), ", secret.Name)
 			if userInput == "all" || utils.ConfirmPrompt() {
-				o.log.Debug(o.ctx, "Deleting secret:'%s'\n", cr.Spec.SecretRef.Name)
+				o.log.Debug(o.ctx, "Deleting secret(%d/%d):'%s'\n", cr.Spec.SecretRef.Name, idx, len(awsCredReqs))
 				// Delete the referenced secret
 				err := o.clusterClientset.CoreV1().Secrets(secret.Namespace).Delete(context.TODO(), secret.Name, metav1.DeleteOptions{})
 				if err != nil {
@@ -904,6 +922,15 @@ func (o *rotateCredOptions) printKeyInfo(currKeys *iam.ListAccessKeysOutput, cli
 	return err
 }
 
+func (o *rotateCredOptions) hasAccessKey(accessKey string, keys *iam.ListAccessKeysOutput) bool {
+	for _, Akey := range keys.AccessKeyMetadata {
+		if *Akey.AccessKeyId == accessKey {
+			return true
+		}
+	}
+	return false
+}
+
 /* Check Access key count for max (2) keys for the provided user.
  * if iam user has max keys, this will prompt (stdout/stdin) the user to interactively delete a key or exit
  * Alternatively, the user can provide the cli arg 'delete-key-id' to delete a key non-interactively.
@@ -927,8 +954,8 @@ func (o *rotateCredOptions) checkAccessKeysMaxDelete(iamUser string, nameSpace s
 	if len(currKeys.AccessKeyMetadata) >= 2 {
 		// TODO: Should this script provide an option to delete the oldest key for the user? Too risky?
 		deleteSuccess := false
-		foundKey := false
 		o.log.Warn(o.ctx, "user:'%s' already has max number of access keys:'%d'\n", iamUser, len(currKeys.AccessKeyMetadata))
+
 		if len(deleteKeyID) <= 0 {
 			fmt.Printf("\nIAM User:'%s' already has max number of access keys:'%d'\n", iamUser, len(currKeys.AccessKeyMetadata))
 			fmt.Println("Would you like to specify an AccessKey to delete now?")
@@ -937,33 +964,43 @@ func (o *rotateCredOptions) checkAccessKeysMaxDelete(iamUser string, nameSpace s
 				fmt.Printf("Cluster account currently in-use accessKeyID:'%s' for user:'%s'\n", clientInput.AccessKeyID, iamUser)
 				fmt.Println("\tUse debug output, and/or aws console info to choose which key to delete.")
 				fmt.Println("\tConsider which key is currently in-use, and/or possibly older key, etc..")
-				fmt.Print("Enter Access Key ID to delete: ")
-				var keyInput string = ""
-				_, _ = fmt.Scanln(&keyInput)
-				// Basic input validation...?
-				if o.isValidAccessKeyId(keyInput) {
-					deleteKeyID = keyInput
+				max_attempts := 3
+				for attempt := 1; attempt <= max_attempts; attempt++ {
+					fmt.Print("Enter Access Key ID to delete: ")
+					var keyInput string = ""
+					_, _ = fmt.Scanln(&keyInput)
+					// Basic input validation...?
+					if o.isValidAccessKeyId(keyInput) {
+						if o.hasAccessKey(keyInput, currKeys) {
+							deleteKeyID = keyInput
+							break
+						} else {
+							fmt.Printf("(attempt %d/%d) Key:'%s' not found in iam.ListAccessKeysOutput\n", attempt, max_attempts, keyInput)
+						}
+					} else {
+						o.log.Error(o.ctx, "(attempt %d/%d) Invalid access key ID entered:'%s'", attempt, max_attempts, keyInput)
+					}
+				}
+				if len(deleteKeyID) <= 0 {
+					return fmt.Errorf("failed to find and delete access key for IAM user:'%s' with user provided input", iamUser)
 				}
 			}
 		}
 		if len(deleteKeyID) > 0 {
 			// Iterate over key list to confirm this key exists for this user
-			for _, Akey := range currKeys.AccessKeyMetadata {
-				if *Akey.AccessKeyId == deleteKeyID {
-					foundKey = true
-					o.log.Info(o.ctx, "Attempting to delete AccessKey:%s\n", deleteKeyID)
-					_, err = o.awsClient.DeleteAccessKey(&iam.DeleteAccessKeyInput{UserName: awsSdk.String(iamUser), AccessKeyId: awsSdk.String(deleteKeyID)})
-					if err != nil {
-						o.log.Warn(o.ctx, "Error attempting to delete accesskey:'%s'\n", deleteKeyID)
-					} else {
-						o.log.Info(o.ctx, "Delete AccessKey:'%s', Success\n", deleteKeyID)
-						deleteSuccess = true
-					}
-					break
+			if o.hasAccessKey(deleteKeyID, currKeys) {
+				o.log.Info(o.ctx, "Attempting to delete AccessKey:%s\n", deleteKeyID)
+				_, err = o.awsClient.DeleteAccessKey(&iam.DeleteAccessKeyInput{UserName: awsSdk.String(iamUser), AccessKeyId: awsSdk.String(deleteKeyID)})
+				if err != nil {
+					o.log.Error(o.ctx, "Error attempting to delete IAM user:'%s' accesskey:'%s'. Err:'%s'\n", iamUser, deleteKeyID, err)
+					return err
+				} else {
+					o.log.Info(o.ctx, "Delete AccessKey:'%s', Success\n", deleteKeyID)
+					deleteSuccess = true
 				}
-			}
-			if !foundKey {
-				o.log.Warn(o.ctx, "AccessKey:'%s', not found in iam.ListAccessKeysOutput\n", deleteKeyID)
+			} else {
+				o.log.Warn(o.ctx, "IAM user:'%s', AccessKey:'%s', not found in iam.ListAccessKeysOutput\n", iamUser, deleteKeyID)
+				return fmt.Errorf("failed to find provided AccessKey:'%s' in iam.ListAccessKeysOutput", deleteKeyID)
 			}
 		}
 		// User has either not chosen to delete a key, or key deletion failed...
@@ -1058,6 +1095,8 @@ func (o *rotateCredOptions) doRotateManagedAdminAWSCreds() error {
 		if err != nil {
 			o.log.Error(o.ctx, "Error! Saving key info to file:'%s', err:%s", saveFileManaged, err)
 			//return err
+		} else {
+			fmt.Printf("\nSaved key to: '%s'\n", saveFileManaged)
 		}
 	}
 	// Place new credentials into body for secret
@@ -1245,6 +1284,8 @@ func (o *rotateCredOptions) doRotateCcsCreds() error {
 			if err != nil {
 				o.log.Error(o.ctx, "Error! Saving key info to file:'%s', err:'%s'", saveFileCcs, err)
 				//return err
+			} else {
+				fmt.Printf("\nSaved key to: '%s'\n", saveFileCcs)
 			}
 		}
 		o.log.Debug(o.ctx, "Updating '%s.%s' secret with new creds...\n", o.account.Spec.ClaimLinkNamespace, secretName)
