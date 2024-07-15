@@ -154,16 +154,6 @@ type rotateCredOptions struct {
 
 }
 
-func fileExists(fpath string) bool {
-	_, err := os.Stat(fpath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return false
-		}
-	}
-	return true
-}
-
 // func newRotateAWSOptions(streams genericclioptions.IOStreams, client *k8s.LazyClient) *rotateCredOptions {
 func newRotateAWSOptions(streams genericclioptions.IOStreams) *rotateCredOptions {
 	return &rotateCredOptions{
@@ -226,34 +216,6 @@ func (o *rotateCredOptions) preRunCliChecks(cmd *cobra.Command, args []string) e
 	}
 	fmt.Println("remove early exit")
 	os.Exit(1)
-	return nil
-}
-
-// Some very basic 'early' validation on the key input if provided.
-// AWS docs, access key constraints: Minimum length of 16. Maximum length of 128.
-func (o *rotateCredOptions) isValidAccessKeyId(keyId string) bool {
-	if len(keyId) < 16 || len(keyId) > 128 {
-		o.log.Error(o.ctx, "Invalid Access key length:%d\n", len(keyId))
-		return false
-	}
-	return true
-}
-
-func (o *rotateCredOptions) printClusterInfo() error {
-	// currently using account byoc value for ccs sanity checks, is this needed?
-	isCCS, err := utils.IsClusterCCS(o.ocmConn, o.clusterID)
-	if err != nil {
-		return err
-	}
-	o.log.Debug(o.ctx, "Is Cluster CCS?:%t\n", isCCS)
-	w := tabwriter.NewWriter(os.Stdout, 1, 1, 1, ' ', 0)
-	fmt.Fprintf(w, "\n----------------------------------------------------------------------\n")
-	fmt.Fprintf(w, "Cluster ID:\t%s\n", o.clusterID)
-	fmt.Fprintf(w, "Cluster External ID:\t%s\n", o.cluster.ExternalID())
-	fmt.Fprintf(w, "Cluster Name:\t%s\n", o.cluster.Name())
-	fmt.Fprintf(w, "Cluster Is CCS:\t%t\n", isCCS)
-	fmt.Fprintf(w, "----------------------------------------------------------------------\n")
-	w.Flush()
 	return nil
 }
 
@@ -349,6 +311,44 @@ func (o *rotateCredOptions) run() error {
 	}
 	fmt.Printf("\nOptions --describe-keys, --describe-secrets can be used to provide additional info/status\n")
 	fmt.Printf("Script Run Completed Successfully.\n")
+	return nil
+}
+
+func fileExists(fpath string) bool {
+	_, err := os.Stat(fpath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false
+		}
+	}
+	return true
+}
+
+// Some very basic 'early' validation on the key input if provided.
+// AWS docs, access key constraints: Minimum length of 16. Maximum length of 128.
+func (o *rotateCredOptions) isValidAccessKeyId(keyId string) bool {
+	if len(keyId) < 16 || len(keyId) > 128 {
+		o.log.Error(o.ctx, "Invalid Access key length:%d\n", len(keyId))
+		return false
+	}
+	return true
+}
+
+func (o *rotateCredOptions) printClusterInfo() error {
+	// currently using account byoc value for ccs sanity checks, is this needed?
+	isCCS, err := utils.IsClusterCCS(o.ocmConn, o.clusterID)
+	if err != nil {
+		return err
+	}
+	o.log.Debug(o.ctx, "Is Cluster CCS?:%t\n", isCCS)
+	w := tabwriter.NewWriter(os.Stdout, 1, 1, 1, ' ', 0)
+	fmt.Fprintf(w, "\n----------------------------------------------------------------------\n")
+	fmt.Fprintf(w, "Cluster ID:\t%s\n", o.clusterID)
+	fmt.Fprintf(w, "Cluster External ID:\t%s\n", o.cluster.ExternalID())
+	fmt.Fprintf(w, "Cluster Name:\t%s\n", o.cluster.Name())
+	fmt.Fprintf(w, "Cluster Is CCS:\t%t\n", isCCS)
+	fmt.Fprintf(w, "----------------------------------------------------------------------\n")
+	w.Flush()
 	return nil
 }
 
@@ -673,9 +673,11 @@ func (o *rotateCredOptions) connectClusterClient() error {
 
 /* fetch and connect to hive cluster for the provided user cluster */
 func (o *rotateCredOptions) connectHiveClient() error {
-	// This requires a valid ocm login token on 'prod', which can differ from the login token needed earlier if the cluster
-	// lives in another env (ie integration or staging) (?)
-	// Loging into Hive Shard here (equiv of 'ocm backplane login $HIVESHARD')
+	// This requires a valid ocm login token on 'prod'.
+	// TODO: Can this differ from the login token needed earlier if the cluster
+	// lives in another env (ie integration or staging) (?) If so this needs to allow a 2 step process with
+	// multiple ocm login tokens(?), 1 for each env.
+	// Logging into Hive Shard here (equiv of 'ocm backplane login $HIVESHARD')
 	// Is specifially creating the hive connection here a better/worse option than connecting via 'ocm backplane'
 	// externally, and using the LazyClient (ie o.kubeCli) instead?
 	// When using the lazyClient, before running this osdctl command, the following was needed:
@@ -813,7 +815,7 @@ func (o *rotateCredOptions) setupAwsClient() error {
 			return fmt.Errorf("support jump role ARN is missing from '%s' configmap:'%s'", common.AWSAccountNamespace, common.DefaultConfigMap)
 		}
 		o.log.Debug(o.ctx, "Using 'AWS-Initial-setup' client to fetch assume role creds for 'SRE Access ARN'...\n")
-		// Assume the ARN
+		// Fetch assumed SRE Access role creds
 		srepRoleCredentials, err := awsprovider.GetAssumeRoleCredentials(awsSetupClient, o.awsAccountTimeout, callerIdentityOutput.UserId, &SREAccessARN)
 		if err != nil {
 			return err
@@ -830,8 +832,7 @@ func (o *rotateCredOptions) setupAwsClient() error {
 			return err
 		}
 
-		// Assume the ARN
-
+		// Fetch assumed support jump role creds
 		o.log.Debug(o.ctx, "Using 'AWS-SRE-Access' client to fetch assume role creds for 'Support Jump Role ARN'...\n")
 		jumpRoleCreds, err := awsprovider.GetAssumeRoleCredentials(srepRoleClient, o.awsAccountTimeout, callerIdentityOutput.UserId, &JumpARN)
 		if err != nil {
@@ -942,7 +943,7 @@ func (o *rotateCredOptions) hasAccessKey(accessKey string, keys *iam.ListAccessK
 	return false
 }
 
-/* Check Access key count for max (2) keys for the provided user.
+/* Check Access key count for AWS documented max (2) keys for the provided user.
  * if iam user has max keys, this will prompt (stdout/stdin) the user to interactively delete a key or exit
  * Alternatively, the user can provide the cli arg 'delete-key-id' to delete a key non-interactively.
  * keys will only be deleted if >1 key exists for the provided iam user.
@@ -955,7 +956,7 @@ func (o *rotateCredOptions) checkAccessKeysMaxDelete(iamUser string, nameSpace s
 	if err != nil {
 		return err
 	}
-	// Print key info for user to review first...
+	// Print key metdata info for user to review, choosing a key to delete, etc...
 	err = o.printKeyInfo(currKeys, clientInput, iamUser)
 	if err != nil {
 		return err
@@ -1307,9 +1308,9 @@ func (o *rotateCredOptions) doRotateCcsCreds() error {
 		}
 		o.log.Debug(o.ctx, "Successfully updated secrets for '%s'\n", userName)
 	} else {
-		// This check should have been performed early.
-		// This check should fail early on before any intrusive ops are attempted to
-		// avoid confusing the end user as to what ops will-be/have-been completed
+		// Thi is a secondary check, and should have also been performed early on.
+		// before any intrusive ops are attempted to avoid confusing the end user as
+		// to what ops will-be/have-been completed
 		o.log.Warn(o.ctx, "account:'%s' is not BYOC/CCS, skipping osdCcsAdmin credential rotation", o.accountID)
 		return nil
 	}
