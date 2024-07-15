@@ -214,8 +214,7 @@ func (o *rotateCredOptions) preRunCliChecks(cmd *cobra.Command, args []string) e
 		o.log.Error(o.ctx, "Failed to load AWS config:'%v'\n", err)
 		return err
 	}
-	fmt.Println("remove early exit")
-	os.Exit(1)
+
 	return nil
 }
 
