@@ -11,6 +11,7 @@ import (
 	"time"
 
 	awsSdk "github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/iam"
 	iamTypes "github.com/aws/aws-sdk-go-v2/service/iam/types"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
@@ -76,14 +77,16 @@ Describe credential-request secrets and AWS Access keys in use by users "OsdMana
 		Short: "Rotate IAM credentials and secrets",
 		Long: `
 Util to rotate managed IAM credentials and related secrets for a given cluster account.
-'Rotate' operations are intended to be somewhat interactive and will provide information 
-followed by prompting the user to verify if and/or how to proceed. 'Describe' operations 
+Please use with caution!
+'Rotate': operations are intended to be somewhat interactive and will provide information 
+followed by prompting the user to verify if and/or how to proceed. 
+'Describe': operations 
 are intended to provide info and status related to the artifacts to be rotated. 
 
 These operations require the following:
-	- A valid cluster-id (not alias)
+	- A valid cluster-id (not an alias)
 	- An elevation reason (hint: This will usually involve a Jira ticket ID.)  
-	- A local AWS profile matching the cluster environment (ie: osd-staging,rhcontrol, etc), if not provided 'default' is used. 
+	- A local AWS profile for the cluster environment (ie: osd-staging, rhcontrol, etc), if not provided 'default' is used. 
 	- A valid OCM token and OCM_CONFIG.  
 `,
 		Example:           examples,
@@ -215,6 +218,14 @@ func (o *rotateCredOptions) preRunCliChecks(cmd *cobra.Command, args []string) e
 			return fmt.Errorf("--save-keys: file '%s' already present, please move/remove before running", saveFileManaged)
 		}
 	}
+	// Fail early if aws config is not correct
+	_, err = config.LoadDefaultConfig(o.ctx, config.WithSharedConfigProfile(o.profile))
+	if err != nil {
+		o.log.Error(o.ctx, "Failed to load AWS config:'%v'\n", err)
+		return err
+	}
+	fmt.Println("remove early exit")
+	os.Exit(1)
 	return nil
 }
 
