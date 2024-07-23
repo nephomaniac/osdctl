@@ -432,6 +432,10 @@ func (o *rotateCredOptions) printAWSCredRequestSecrets(awsCredReqs *[]credreqv1.
 		}
 		awsCredReqs = &reqs
 	}
+	if awsCredReqs == nil {
+		fmt.Println("No AWS provider Credential Requests to show")
+		return nil
+	}
 	w := tabwriter.NewWriter(os.Stdout, 1, 1, 1, ' ', 0)
 	fmt.Fprintf(w, "--------------------------------------------------------------------------\n")
 	fmt.Fprintf(w, "AWS CredentialsRequest referenced secrets:\n")
@@ -457,6 +461,9 @@ func (o *rotateCredOptions) deleteAWSCredRequestSecrets() error {
 	if err != nil {
 		o.log.Warn(o.ctx, "Error fetching AWS related credentialRequests to delete secrets, err:'%s'\n", err)
 		return err
+	}
+	if awsCredReqs == nil {
+		return fmt.Errorf("failed to find any AWS provider credential request secrets to delete")
 	}
 	fmt.Printf("\nAWS CredentialRequest referenced secrets to be deleted:\n")
 	// Print secrets info for user to review before choosing to continue
@@ -683,7 +690,7 @@ func (o *rotateCredOptions) connectHiveClient() error {
 	//  # HIVESHARD=$(ocm get /api/clusters_mgmt/v1/clusters/$INTERNAL_ID/provision_shard | jq -r '.hive_config.server' | sed 's/.*api\.//;s/\..*//')
 	//  (ie HIVESHARD="hives02ue1")
 	//  # ocm backplane login $HIVESHARD
-	//  # osdctl account rotate-secret ${AWS_CLAIM} -p ${aws_profile} --ccs --reason "${reason}"
+	//  # osdctl account $cred_rotate_cmd $options....
 	//
 	o.log.Info(o.ctx, "Connect hive client for cluster:'%s'\n", o.clusterID)
 	if len(o.reason) <= 0 {
@@ -731,12 +738,12 @@ func (o *rotateCredOptions) fetchAWSAccountInfo() error {
 	}
 
 	if accountObj.Spec.ManualSTSMode {
-		return fmt.Errorf("account %s is STS - No IAM User Credentials to Rotate", o.claimName)
+		return fmt.Errorf("account %s is manual STS mode - No IAM User Credentials to Rotate", o.claimName)
 	}
 	if !accountObj.Spec.BYOC && o.updateCcsCredsCli {
 		// Check for specifics early? ...or should this just be ignored and a no-op later?
-		o.log.Warn(o.ctx, "arg '--ccs' provided to rotate osdCcsAdmin creds on non-CCS cluster id:'%s', name:'%s'\n. No changes were made to this cluster\n", o.cluster.Name(), o.clusterID)
-		return fmt.Errorf("arg '--ccs' provided to rotate osdCcsAdmin creds on non-CCS cluster")
+		o.log.Warn(o.ctx, "arg '--rotate-ccs-admin' provided to rotate osdCcsAdmin creds on non-CCS cluster id:'%s', name:'%s'\n. No changes were made to this cluster\n", o.cluster.Name(), o.clusterID)
+		return fmt.Errorf("arg '--rotate-ccs-admin' provided to rotate osdCcsAdmin creds on non-CCS cluster")
 	}
 	o.account = accountObj
 
@@ -775,6 +782,7 @@ func (o *rotateCredOptions) setupAwsClient() error {
 	o.log.Debug(o.ctx, "----------------------------------------------------------------------\n")
 
 	o.log.Debug(o.ctx, "Creating 'AWS-Initial-setup' client using local aws profile: '%s'...\n", o.profile)
+	// Since this is only using "IAM", hard coding to us-east-1 region should be ok...
 	awsSetupClient, err := awsprovider.NewAwsClient(o.profile, "us-east-1", "")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to create initial AWS client. Check local AWS config/profile:'%s', connection, etc?\n", o.profile)
