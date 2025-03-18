@@ -58,12 +58,21 @@ type transferOwnerOptions struct {
 	GlobalOptions *globalflags.GlobalOptions
 }
 
+const transferOwnerCmdExample = `
+  # Transfer ownership
+  osdctl cluster transfer-owner --new-owner "new_OCM_userName" --cluster-id 1kfmyclusteristhebesteverp8m --reason "transfer ownership per jira-id"
+
+  # Update pull secret without transfering ownership
+  osdctl cluster transfer-owner --pull-secret-only --cluster-id 1kfmyclusteristhebesteverp8m --reason "update pull secret per jira-id" 
+`
+
 func newCmdTransferOwner(streams genericclioptions.IOStreams, globalOpts *globalflags.GlobalOptions) *cobra.Command {
 	ops := newTransferOwnerOptions(streams, globalOpts)
 	transferOwnerCmd := &cobra.Command{
 		Use:               "transfer-owner",
 		Short:             "Transfer cluster ownership to a new user (to be done by Region Lead)",
 		Args:              cobra.NoArgs,
+		Example:           transferOwnerCmdExample,
 		DisableAutoGenTag: true,
 		Run: func(cmd *cobra.Command, args []string) {
 			cmdutil.CheckErr(ops.run())
@@ -73,7 +82,7 @@ func newCmdTransferOwner(streams genericclioptions.IOStreams, globalOpts *global
 	transferOwnerCmd.Flags().StringVarP(&ops.clusterID, "cluster-id", "C", "", "The Internal Cluster ID/External Cluster ID/ Cluster Name")
 	transferOwnerCmd.Flags().StringVar(&ops.newOwnerName, "new-owner", ops.newOwnerName, "The new owners username to transfer the cluster to")
 	transferOwnerCmd.Flags().BoolVarP(&ops.dryrun, "dry-run", "d", false, "Dry-run - show all changes but do not apply them")
-	transferOwnerCmd.Flags().BoolVar(&ops.doPullSecretOnly, "pull-secret-only", false, "pull-secret-only - only update cluster pull secret from OCM data using existing OCM owner info..")
+	transferOwnerCmd.Flags().BoolVar(&ops.doPullSecretOnly, "pull-secret-only", false, "Update cluster pull secret from current OCM AccessToken data without ownership transfer")
 	transferOwnerCmd.Flags().StringVar(&ops.reason, "reason", "", "The reason for this command, which requires elevation, to be run (usualy an OHSS or PD ticket)")
 
 	_ = transferOwnerCmd.MarkFlagRequired("cluster-id")
@@ -279,8 +288,52 @@ func rolloutTelemeterClientPods(clientset *kubernetes.Clientset, namespace, sele
 	fmt.Printf("Pods in namespace %s with label selector '%s' have been deleted.\n", namespace, selector)
 	return nil
 }
+func getPullSecretTokenAuth(registryID string, secret *corev1.Secret) (*amv1.AccessTokenAuth, error) {
+	if len(registryID) <= 0 {
+		return nil, fmt.Errorf("error: registryID empty in getPullSecretToken()")
+	}
+	dockerConfigJsonBytes, found := secret.Data[".dockerconfigjson"]
+	if !found {
+		return nil, fmt.Errorf("secret missing '.dockerconfigjson'?")
+	}
+	dockerConfigJson, err := amv1.UnmarshalAccessToken(dockerConfigJsonBytes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse secret, err: %w", err)
+	}
+	registryAuth, found := dockerConfigJson.Auths()[registryID]
+	if !found {
+		return nil, fmt.Errorf("error: registry '%s not found in pull_secret.auths", registryID)
+	}
+	return registryAuth, nil
+}
 
-func verifyClusterPullSecret(clientset *kubernetes.Clientset, expectedPullSecret string) error {
+func comparePullSecretAuths(pullSecret *corev1.Secret, expectedAuths map[string]*amv1.AccessTokenAuth) error {
+	var errString strings.Builder
+	for akey, auth := range expectedAuths {
+		// Find the matching auth entry for this registry name in the cluster pull_secret data...
+		psTokenAuth, err := getPullSecretTokenAuth(akey, pullSecret)
+		if err != nil {
+			errString.WriteString(fmt.Sprintf("Failed to fetch expected auth['%s'] from cluster pull-secret, err:'%s'.\n", akey, err))
+		}
+		if auth.Auth() != psTokenAuth.Auth() {
+			errString.WriteString(fmt.Sprintf("Expected auth['%s'] does not match authToken found in cluster pull-secret.\n", akey))
+		} else {
+			fmt.Printf("Expected auth['%s'] and cluster tokens match\n", akey)
+		}
+		if auth.Email() != psTokenAuth.Email() {
+			errString.WriteString(fmt.Sprintf("Expected auth['%s'] does not match email found in cluster pull-secret.\n", akey))
+		} else {
+			fmt.Printf("Expected auth['%s'] and cluster emails match\n", akey)
+		}
+	}
+	if errString.Len() <= 0 {
+		return nil
+	} else {
+		return fmt.Errorf("%s", errString.String())
+	}
+}
+
+func verifyClusterPullSecret(clientset *kubernetes.Clientset, expectedPullSecret string, expectedAuths map[string]*amv1.AccessTokenAuth) error {
 	// Retrieve the pull secret from the "openshift-config" namespace
 	pullSecret, err := clientset.CoreV1().Secrets("openshift-config").Get(context.TODO(), "pull-secret", metav1.GetOptions{})
 	if err != nil {
@@ -292,12 +345,22 @@ func verifyClusterPullSecret(clientset *kubernetes.Clientset, expectedPullSecret
 	if !ok {
 		return fmt.Errorf("pull secret data not found in the secret")
 	}
+	err = comparePullSecretAuths(pullSecret, expectedAuths)
+	if err != nil {
+		fmt.Printf("\nFound mis-matching auth values during compare. Please review:\n%s\n", err)
+		fmt.Printf("Would you like to continue?")
+		if !utils.ConfirmPrompt() {
+			return fmt.Errorf("operation aborted by the user")
+		}
+	} else {
+		fmt.Printf("Cluster pull-secret contains subset of Auths from AuthToken with matching tokens + emails. PASS\n")
+	}
 
 	fmt.Println("Actual Cluster Pull Secret:")
 	fmt.Println(string(pullSecretData))
 
 	// Print the expected pull secret
-	fmt.Println("\nExpected Cluster Pull Secret:")
+	fmt.Println("\nExpected AccessToken Subset of Cluster Pull Secret:")
 	fmt.Println(expectedPullSecret)
 
 	// TODO: Consider confirming that the email and token values of the 'subset' of Auths
@@ -324,7 +387,7 @@ func verifyClusterPullSecret(clientset *kubernetes.Clientset, expectedPullSecret
 }
 
 func updateManifestWork(conn *sdk.Connection, kubeCli client.Client, clusterID, mgmtClusterName string, pullsecret []byte) error {
-
+	fmt.Printf("updateManifestwork begin...\n")
 	if err := workv1.AddToScheme(kubeCli.Scheme()); err != nil {
 		return fmt.Errorf("failed to add scheme: %w", err)
 	}
@@ -351,6 +414,7 @@ func updateManifestWork(conn *sdk.Connection, kubeCli client.Client, clusterID, 
 	}
 	newSecretName := secretNamePrefix + "-" + randomSuffix("0123456789abcdef", 6)
 
+	fmt.Printf("get() Manifestwork...\n")
 	manifestWork := &workv1.ManifestWork{}
 	err = kubeCli.Get(context.TODO(), types.NamespacedName{Name: manifestWorkName, Namespace: manifestWorkNamespace}, manifestWork)
 	if err != nil {
@@ -410,13 +474,15 @@ func updateManifestWork(conn *sdk.Connection, kubeCli client.Client, clusterID, 
 		}
 	}
 
+	fmt.Printf("update() Manifestwork...\n")
 	err = kubeCli.Update(context.TODO(), manifestWork, &client.UpdateOptions{})
 	if err != nil {
 		return fmt.Errorf("cannot update the pull-secret within manifestwork: %w", err)
 	}
 
 	// The secret will be synced to the management cluster and guest cluster in a few seconds, wait here
-	fmt.Println("sleep 60 seconds here to make sure secret gets synced on guest cluster")
+	fmt.Println("Manifest work updated. ")
+	fmt.Println("Sleeping 60 seconds here to allow secret to be synced on guest cluster")
 	time.Sleep(time.Second * 60)
 
 	return nil
@@ -482,7 +548,8 @@ func (o *transferOwnerOptions) run() error {
 	var userDetails *amv1.AccountGetResponse
 	var ok bool
 	if o.doPullSecretOnly {
-		// Use existing User Name...
+		// This is updating the pull secret and not a ownwership transfer.
+		// Use existing subscription, account, and userName value...
 		subscription, err = utils.GetSubscription(ocm, o.clusterID)
 		if err != nil {
 			return fmt.Errorf("Failed to get subscription info for cluster:'%s', err: '%v'", o.clusterID, err)
@@ -491,13 +558,10 @@ func (o *transferOwnerOptions) run() error {
 		if err != nil {
 			return fmt.Errorf("Failed to get account info from subscription, err:'%v'", err)
 		}
-		//oldOwnerAccount, ok = subscription.GetCreator()
-		//if !ok {
-		//	return fmt.Errorf("Failed to get account info for:'%s'", subscription.Creator().ID())
-		//}
 		userName = oldOwnerAccount.Username()
 		fmt.Printf("Old username:'%s'\n", userName)
 	} else {
+		// This is an ownership transfer.
 		// Lookup New Owner Name...
 		userDetails, err = ocm.AccountsMgmt().V1().Accounts().Account(o.newOwnerName).Get().Send()
 		if err != nil {
@@ -587,11 +651,11 @@ func (o *transferOwnerOptions) run() error {
 	}
 	var newAccount *amv1.Account = nil
 	var newOrganization *amv1.Organization = nil
-	var newOrganizationId string
 	var oldUsername string
 	if o.doPullSecretOnly {
-		// Not doing an owner transfer, new info == old info.
-		// TODO: Can likely skip most of the next set of checks
+		// This is not an ownership transfer, just pull-secret update,
+		// new info == old info.
+		// TODO: Can likely skip most of the next set of checks, but why not?
 		oldUsername, ok = oldOwnerAccount.GetUsername()
 		if !ok {
 			fmt.Printf("old username not found?\n")
@@ -599,12 +663,24 @@ func (o *transferOwnerOptions) run() error {
 		fmt.Printf("Using old account values. OwnerAccount:'%s'\n", oldUsername)
 		newAccount = oldOwnerAccount
 		newOrganization = oldOrganization
-		newOrganizationId = oldOrganizationId
 	} else {
 		newAccount, err = utils.GetAccount(ocm, o.newOwnerName)
 		if err != nil {
 			return fmt.Errorf("could not get new owners account: %w", err)
 		}
+		newOrganization, ok = newAccount.GetOrganization()
+		if !ok {
+			return fmt.Errorf("new account has no organization")
+		}
+	}
+
+	newOrganizationId, ok := newOrganization.GetID()
+	if !ok {
+		return fmt.Errorf("new organization has no ID")
+	}
+	fmt.Printf("old orgID:'%s', new orgID:'%s'\n", newOrganizationId, oldOrganizationId)
+	if o.doPullSecretOnly && newOrganizationId != oldOrganizationId {
+		return fmt.Errorf("new org != old org. Ownership transfer not expected with pull-secret-only flag")
 	}
 
 	accountID, ok := newAccount.GetID()
@@ -672,7 +748,8 @@ func (o *transferOwnerOptions) run() error {
 	var postCmd servicelog.PostCmdOptions
 	//TODO: If only updating the pull-secret, and not transfering ownership
 	//      should we send a SL both before and after the rotate operation?
-	//      Currently only sending one after the update is completed.
+	//      Currently only sending an after the pull-secret update is completed
+	//      when not also transfering ownership.
 	if !o.doPullSecretOnly {
 		// Send a SL saying we're about to start ownership transfer
 		fmt.Println("Notify the customer before ownership transfer commences. Sending service log.")
@@ -709,6 +786,7 @@ func (o *transferOwnerOptions) run() error {
 	}
 
 	masterKubeCli, _, masterKubeClientSet, err := common.GetKubeConfigAndClient(masterCluster.ID(), elevationReasons...)
+	fmt.Printf("Done, created masterKubeCli\n")
 	if err != nil {
 		return fmt.Errorf("failed to retrieve Kubernetes configuration and client for Hive cluster ID %s: %w", masterCluster.ID(), err)
 	}
@@ -761,7 +839,7 @@ func (o *transferOwnerOptions) run() error {
 	}
 
 	// Print the pull secret
-	fmt.Println("Pull Secret:")
+	fmt.Println("Please review formatted Pull Secret data to be used for update:")
 	fmt.Println(string(pullSecret))
 
 	// Ask the user if they would like to continue
@@ -789,10 +867,12 @@ func (o *transferOwnerOptions) run() error {
 		}
 	}
 
+	fmt.Println("Create cluster kubecli...")
 	_, _, targetClientSet, err := common.GetKubeConfigAndClient(o.clusterID, elevationReasons...)
 	if err != nil {
 		return fmt.Errorf("failed to retrieve Kubernetes configuration and client for cluster with ID %s: %w", o.clusterID, err)
 	}
+	fmt.Println("Cluster kubecli created")
 
 	// Rollout the telemeterClient pod for non HCP clusters
 	if !o.hypershift {
@@ -802,14 +882,14 @@ func (o *transferOwnerOptions) run() error {
 		}
 	}
 
-	err = verifyClusterPullSecret(targetClientSet, string(pullSecret))
+	err = verifyClusterPullSecret(targetClientSet, string(pullSecret), auths)
 	if err != nil {
 		return fmt.Errorf("error verifying cluster pull secret: %w", err)
 	}
 
 	if o.doPullSecretOnly {
 		// User has chosen to update pull secret w/o ownership transfer.
-		// Send SL to notify customer this is completed.
+		// Send SL to notify customer this is completed, then return the command.
 		fmt.Println("Notify the customer the pull-secret update is completed. Sending service log.")
 		//postCmd = generateServiceLog(slParams, SL_PULL_SECRET_ROTATED)
 		postCmd = servicelog.PostCmdOptions{
@@ -827,6 +907,8 @@ func (o *transferOwnerOptions) run() error {
 		fmt.Printf("Pull secret update complete, exiting successfully\n")
 		return nil
 	}
+
+	// Transfer ownership specific operations...
 
 	fmt.Printf("Transfer cluster: \t\t'%v' (%v)\n", externalClusterID, cluster.Name())
 	fmt.Printf("from user \t\t\t'%v' to '%v'\n", oldOwnerAccount.ID(), accountID)
@@ -883,7 +965,7 @@ func (o *transferOwnerOptions) run() error {
 		response, err := subscriptionClient.Update().Body(subscriptionOrgPatch).Send()
 
 		if err != nil || response.Status() != 200 {
-			return fmt.Errorf("request failed with status: %d, '%w'", response.Status(), err)
+			return fmt.Errorf("Update Subscription request to patch org failed with status: %d,  err:'%w'", response.Status(), err)
 		}
 		fmt.Printf("Patched organization on subscription\n")
 	}
@@ -892,7 +974,7 @@ func (o *transferOwnerOptions) run() error {
 	patchRes, err := subscriptionCreatorPatchRequest.Send()
 
 	if err != nil || patchRes.Status() != 200 {
-		return fmt.Errorf("request failed with status: %d, '%w'", patchRes.Status(), err)
+		return fmt.Errorf("Subscription request request to patch creator failed with status: %d, err: '%w'", patchRes.Status(), err)
 	}
 	fmt.Printf("Patched creator on subscription\n")
 
@@ -900,7 +982,7 @@ func (o *transferOwnerOptions) run() error {
 	err = deleteOldRoleBinding(ocm, subscriptionID)
 
 	if err != nil {
-		fmt.Printf("can't delete old rolebinding %v \n", err)
+		fmt.Printf("Warning, can't delete old rolebinding, err: %v \n", err)
 	}
 
 	// create new rolebinding
@@ -909,13 +991,13 @@ func (o *transferOwnerOptions) run() error {
 
 	// don't fail if the rolebinding already exists, could be rerun
 	if err != nil {
-		return fmt.Errorf("request failed '%w'", err)
+		return fmt.Errorf("Account new roleBinding request failed, err: '%w'", err)
 	} else if postRes.Status() == 201 {
 		fmt.Printf("Created new role binding.\n")
 	} else if postRes.Status() == 409 {
 		fmt.Printf("can't add new rolebinding, rolebinding already exists\n")
 	} else {
-		return fmt.Errorf("request failed with status: %d, '%w'", postRes.Status(), err)
+		return fmt.Errorf("Account new roleBinding request failed with status: %d, err: '%w'", postRes.Status(), err)
 	}
 
 	// If the organization id has changed, re-register the cluster with CS with the new organization id
@@ -923,19 +1005,19 @@ func (o *transferOwnerOptions) run() error {
 
 		request, err := createNewRegisterClusterRequest(ocm, externalClusterID, subscriptionID, newOrganizationId, clusterURL, displayName)
 		if err != nil {
-			return fmt.Errorf("can't create RegisterClusterRequest with CS, '%w'", err)
+			return fmt.Errorf("can't create RegisterClusterRequest with CS, err:'%w'", err)
 		}
 
 		response, err := request.Send()
 		if err != nil || (response.Status() != 200 && response.Status() != 201) {
-			return fmt.Errorf("request failed with status: %d, '%w'", response.Status(), err)
+			return fmt.Errorf("NewRegisterClusterRequest failed with status: %d, err:'%w'", response.Status(), err)
 		}
 		fmt.Print("Re-registered cluster\n")
 	}
 
 	err = validateTransfer(ocm, subscription.ClusterID(), newOrganizationId)
 	if err != nil {
-		return fmt.Errorf("error while validating transfer %w", err)
+		return fmt.Errorf("error while validating transfer. %w", err)
 	}
 	fmt.Print("Transfer complete\n")
 
@@ -957,7 +1039,7 @@ func getRoleBinding(ocm *sdk.Connection, subscriptionID string) (*amv1.RoleBindi
 		Send()
 
 	if err != nil {
-		return nil, fmt.Errorf("can't send request: %v", err)
+		return nil, fmt.Errorf("RoleBindings list, can't send request: %v", err)
 	}
 
 	if response.Total() == 0 {
@@ -978,19 +1060,19 @@ func deleteOldRoleBinding(ocm *sdk.Connection, subscriptionID string) error {
 	oldRoleBinding, err := getRoleBinding(ocm, subscriptionID)
 
 	if err != nil {
-		return fmt.Errorf("can't get old owners rolebinding %w", err)
+		return fmt.Errorf("can't get old owners rolebinding: %w", err)
 	}
 
 	oldRoleBindingID, ok := oldRoleBinding.GetID()
 	if !ok {
-		return fmt.Errorf("old rolebinding has no id %w", err)
+		return fmt.Errorf("old rolebinding has no id, err: %w", err)
 	}
 	oldRoleBindingClient := ocm.AccountsMgmt().V1().RoleBindings().RoleBinding(oldRoleBindingID)
 
 	response, err := oldRoleBindingClient.Delete().Send()
 
 	if err != nil {
-		return fmt.Errorf("request failed '%w'", err)
+		return fmt.Errorf("request failed, err: '%w'", err)
 	}
 	if response.Status() == 204 {
 		fmt.Printf("Deleted old rolebinding: %v\n", oldRoleBindingID)
@@ -1000,7 +1082,7 @@ func deleteOldRoleBinding(ocm *sdk.Connection, subscriptionID string) error {
 		fmt.Printf("can't find old rolebinding: %v\n", oldRoleBindingID)
 		return nil
 	}
-	fmt.Printf("request failed with status: %d\n", response.Status())
+	fmt.Printf("delete RoleBindingrequest failed with status: %d\n", response.Status())
 	return nil
 }
 
@@ -1021,7 +1103,7 @@ func createSubscriptionCreatorPatchRequest(ocm *sdk.Connection, subscriptionID s
 
 	body, err := json.Marshal(CreatorPatch{accountID})
 	if err != nil {
-		return nil, fmt.Errorf("cannot create body for request '%w'", err)
+		return nil, fmt.Errorf("cannot create body for request, err: '%w'", err)
 	}
 
 	request.Bytes(body)
@@ -1055,7 +1137,7 @@ func createNewRegisterClusterRequest(ocm *sdk.Connection, externalClusterID stri
 
 	body, err := json.Marshal(RegisterCluster{externalClusterID, subscriptionID, organizationID, consoleURL, displayName})
 	if err != nil {
-		return nil, fmt.Errorf("cannot create body for request '%w'", err)
+		return nil, fmt.Errorf("cannot create body for request, err: '%w'", err)
 	}
 
 	request.Bytes(body)
@@ -1072,7 +1154,7 @@ func validateTransfer(ocm *sdk.Connection, clusterID string, newOrgID string) er
 		Send()
 
 	if err != nil || response.Status() != 200 {
-		return fmt.Errorf("request failed with status: %d, '%w'", response.Status(), err)
+		return fmt.Errorf("list clusters request failed with status: %d, err: '%w'", response.Status(), err)
 	}
 
 	if response.Total() == 0 {
