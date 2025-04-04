@@ -47,6 +47,7 @@ func NewCmdCluster(streams genericclioptions.IOStreams, client *k8s.LazyClient, 
 	clusterCmd.AddCommand(sre_operators.NewCmdSREOperators(streams, client))
 	clusterCmd.AddCommand(newCmdGetEnvVars())
 	clusterCmd.AddCommand(reports.NewCmdReports())
+	clusterCmd.AddCommand(newCmdTestHiveLogin())
 	return clusterCmd
 }
 
