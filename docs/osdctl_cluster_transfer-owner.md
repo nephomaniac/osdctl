@@ -6,6 +6,15 @@ Transfer cluster ownership to a new user (to be done by Region Lead)
 osdctl cluster transfer-owner [flags]
 ```
 
+### Examples
+
+```
+
+  # Transfer ownership
+  osdctl cluster transfer-owner --new-owner "new_OCM_userName" --cluster-id 1kfmyclusteristhebesteverp8m --reason "transfer ownership per jira-id"
+
+```
+
 ### Options
 
 ```
