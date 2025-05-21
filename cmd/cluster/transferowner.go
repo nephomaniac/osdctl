@@ -578,18 +578,6 @@ func (o *transferOwnerOptions) run() error {
 		if err != nil {
 			return fmt.Errorf("could not get current owner's account, ask the user to log into http://console.redhat.com/ and try again: %w", err)
 		}
-		/* MATTMERGE (removed?)
-		// This is an ownership transfer.
-		// Lookup New Owner Name...
-
-		userDetails, err = ocm.AccountsMgmt().V1().Accounts().Account(o.newOwnerName).Get().Send()
-		if err != nil {
-			return fmt.Errorf("failed to fetch Account info, err:'%v'", err)
-		ok := false
-		userName, ok = userDetails.Body().GetUsername()
-		if !ok {
-			return fmt.Errorf("failed to get username from new user id")
-		}*/
 	}
 
 	var mgmtCluster, svcCluster, hiveCluster, masterCluster *cmv1.Cluster
