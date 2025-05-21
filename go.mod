@@ -2,6 +2,8 @@ module github.com/openshift/osdctl
 
 go 1.23.6
 
+replace github.com/openshift/backplane-cli v0.1.46 => /Users/maclark/sandbox/backplane-cli
+
 require (
 	cloud.google.com/go/compute v1.33.0
 	github.com/Dynatrace/dynatrace-operator v0.14.2

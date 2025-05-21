@@ -163,6 +163,118 @@ func GenerateQuery(clusterIdentifier string) string {
 }
 
 // Creates a connection to OCM
+/*=======
+// Finds the OCM Configuration file and returns the path to it
+// Taken wholesale from	openshift-online/ocm-cli
+func getOCMConfigLocation() (string, error) {
+	if ocmconfig := os.Getenv("OCM_CONFIG"); ocmconfig != "" {
+		return ocmconfig, nil
+	}
+
+	// Determine home directory to use for the legacy file path
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+
+	path := filepath.Join(home, ".ocm.json")
+
+	_, err = os.Stat(path)
+	if os.IsNotExist(err) {
+		// Determine standard config directory
+		configDir, err := os.UserConfigDir()
+		if err != nil {
+			return path, err
+		}
+
+		// Use standard config directory
+		path = filepath.Join(configDir, "/ocm/ocm.json")
+	}
+
+	return path, nil
+}
+
+func GetOCMConfigFromEnv() (*Config, error) {
+	return loadOCMConfig()
+}
+
+// Loads the OCM Configuration file
+// Taken wholesale from	openshift-online/ocm-cli
+func loadOCMConfig() (*Config, error) {
+	var err error
+
+	file, err := getOCMConfigLocation()
+	if err != nil {
+		return nil, err
+	}
+
+	_, err = os.Stat(file)
+	if os.IsNotExist(err) {
+		cfg := &Config{}
+		err = nil
+		return cfg, err
+	}
+
+	if err != nil {
+		err = fmt.Errorf("can't check if config file '%s' exists: %v", file, err)
+		return nil, err
+	}
+
+	data, err := os.ReadFile(file)
+	if err != nil {
+		err = fmt.Errorf("can't read config file '%s': %v", file, err)
+		return nil, err
+	}
+
+	if len(data) == 0 {
+		return nil, nil
+	}
+
+	cfg := &Config{}
+	err = json.Unmarshal(data, cfg)
+
+	if err != nil {
+		err = fmt.Errorf("can't parse config file '%s': %v", file, err)
+		return cfg, err
+	}
+
+	return cfg, nil
+}
+
+func getOcmConfiguration(ocmConfigLoader func() (*Config, error)) (*Config, error) {
+	tokenEnv := os.Getenv("OCM_TOKEN")
+	urlEnv := os.Getenv("OCM_URL")
+	refreshTokenEnv := os.Getenv("OCM_REFRESH_TOKEN") // Unlikely to be set, but check anyway
+
+	config := &Config{}
+
+	// If missing required data, load from the config file.
+	// We don't want to always load this, because the user might only use environment variables.
+	if tokenEnv == "" || refreshTokenEnv == "" || urlEnv == "" {
+		var fileConfigLoadError error
+		config, fileConfigLoadError = ocmConfigLoader()
+		if fileConfigLoadError != nil {
+			return config, fmt.Errorf("could not load OCM configuration file")
+		}
+	}
+
+	// Overwrite with set environment variables, to allow users to overwrite
+	// their configuration file's variables
+	if tokenEnv != "" {
+		config.AccessToken = tokenEnv
+	}
+	if urlEnv != "" {
+		config.URL = urlEnv
+	}
+	if refreshTokenEnv != "" {
+		config.RefreshToken = refreshTokenEnv
+	}
+
+	return config, nil
+}
+
+>>>>>>> a7ea81e (OSD-28241: Added utils for building OCM config, and backplane connections using provided OCM connections)
+*/
 func CreateConnection() (*sdk.Connection, error) {
 	urlEnv := os.Getenv("OCM_URL")
 	var ocmApiOverride string
@@ -291,6 +403,36 @@ func GetHiveShard(clusterID string) (string, error) {
 	return shard, nil
 }
 
+// Returns the hive shard corresponding to a cluster using provided OCM connection
+// e.g. https://api.<hive_cluster>.byo5.p1.openshiftapps.com:6443
+func GetHiveShardWithConn(clusterID string, conn *sdk.Connection) (string, error) {
+	if conn == nil {
+		return "", fmt.Errorf("nil OCM sdk connection provided to GetHiveShardWithConn()")
+	}
+
+	shardPath, err := conn.ClustersMgmt().V1().Clusters().
+		Cluster(clusterID).
+		ProvisionShard().
+		Get().
+		Send()
+
+	if err != nil {
+		return "", err
+	}
+
+	var shard string
+
+	if shardPath != nil {
+		shard = shardPath.Body().HiveConfig().Server()
+	}
+
+	if shard == "" {
+		return "", fmt.Errorf("Unable to retrieve shard for cluster %s", clusterID)
+	}
+
+	return shard, nil
+}
+
 func GetHiveCluster(clusterId string) (*cmv1.Cluster, error) {
 	conn, err := CreateConnection()
 	if err != nil {
@@ -324,6 +466,55 @@ func GetHiveCluster(clusterId string) (*cmv1.Cluster, error) {
 	}
 
 	return resp.Items().Get(0), nil
+}
+
+// Fetch Hive Cluster with provided OCM connections.
+// In the case that the target cluster(stage, integration, etc does not reside
+// in the same OCM env as Hive (prod), separate OCM SDK connections
+// can be provided for accessing each. If nil is provided a temporary connection using
+// the default OCM env vars will be made.
+func GetHiveClusterWithConns(clusterId string, clusterOCM *sdk.Connection, hiveOCM *sdk.Connection) (*cmv1.Cluster, error) {
+	var err error = nil
+	if clusterOCM == nil {
+		clusterOCM, err = CreateConnection()
+		if err != nil {
+			return nil, err
+		}
+		defer clusterOCM.Close()
+	}
+	if hiveOCM == nil {
+		hiveOCM = clusterOCM
+	}
+	provisionShard, err := clusterOCM.ClustersMgmt().V1().Clusters().
+		Cluster(clusterId).
+		ProvisionShard().
+		Get().
+		Send()
+	if err != nil {
+		fmt.Printf("Failed to get provisionShard for cluster:'%s', err:'%v'", clusterId, err)
+		return nil, err
+	}
+
+	hiveApiUrl, ok := provisionShard.Body().HiveConfig().GetServer()
+	if !ok {
+		fmt.Printf("No provisionShard found for cluster:'%s'", clusterId)
+		return nil, fmt.Errorf("no provision shard url found for %s", clusterId)
+	}
+	resp, err := hiveOCM.ClustersMgmt().V1().Clusters().List().
+		Parameter("search", fmt.Sprintf("api.url='%s'", hiveApiUrl)).
+		Send()
+	if err != nil {
+		fmt.Printf("Error listing clusters with hiveApiUrl:'%s'", hiveApiUrl)
+		return nil, err
+	}
+
+	if resp.Items().Empty() {
+		fmt.Printf("Failed to find hive cluster from hiveApiURL:'%s'", hiveApiUrl)
+		return nil, fmt.Errorf("failed to find cluster with api.url=%s", hiveApiUrl)
+	}
+
+	return resp.Items().Get(0), nil
+
 }
 
 // GetManagementCluster returns the OCM Cluster object for a provided clusterId
@@ -505,4 +696,64 @@ func SendRequest(request *sdk.Request) (*sdk.Response, error) {
 		return nil, fmt.Errorf("cannot send request: %q", err)
 	}
 	return response, nil
+}
+
+// Creates an OCM Config object from values read at provided filePath
+// utils has a local 'copy' of the config struct
+// rather than vendor from "github.com/openshift-online/ocm-cli/pkg/config"
+func GetOcmConfigFromFilePath(filePath string) (*ocmConfig.Config, error) {
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		err = fmt.Errorf("can't read config file '%s': %v", filePath, err)
+		return nil, err
+	}
+
+	if len(data) == 0 {
+		return nil, fmt.Errorf("empty config file:'%s'", filePath)
+	}
+	cfg := &ocmConfig.Config{}
+	err = json.Unmarshal(data, cfg)
+	if err != nil {
+		err = fmt.Errorf("can't parse config file '%s': %v", filePath, err)
+		return nil, err
+	}
+	return cfg, nil
+}
+
+func GetOCMSdkConnBuilderFromConfig(ocmConf *ocmConfig.Config) (*sdk.ConnectionBuilder, error) {
+	if ocmConf == nil {
+		return nil, fmt.Errorf("nil OCM config provided to OCMSdkConnBuilderFromConfig()")
+	}
+	// Can use the sdk.connection builder or alternatively omc cli's connection builder wrappers here.
+	// Each returns an ocm-sdk connection builder.
+	ocmSdkConnBuilder := sdk.NewConnectionBuilder()
+	ocmSdkConnBuilder.URL(ocmConf.URL)
+	ocmSdkConnBuilder.Tokens(ocmConf.AccessToken, ocmConf.RefreshToken)
+	ocmSdkConnBuilder.Client(ocmConf.ClientID, ocmConf.ClientSecret)
+	return ocmSdkConnBuilder, nil
+}
+
+// Returns an ocmSdkConnBuilder with initial values read from provided configFilePath.
+func GetOCMSdkConnBuilderFromFilePath(configFilePath string) (*sdk.ConnectionBuilder, error) {
+	// Now get the backplane url and access token from OCM...
+	ocmConf, err := GetOcmConfigFromFilePath(configFilePath)
+	if err != nil {
+		return nil, err
+	}
+	return GetOCMSdkConnBuilderFromConfig(ocmConf)
+
+}
+
+// Returns an OCM SDK connection using values read from provided configFilePath.
+func GetOCMSdkConnFromFilePath(configFilePath string) (*sdk.Connection, error) {
+	ocmSdkConnBuilder, err := GetOCMSdkConnBuilderFromFilePath(configFilePath)
+	if err != nil {
+		return nil, err
+	}
+	ocmSdkConn, err := ocmSdkConnBuilder.Build()
+
+	if err != nil {
+		return nil, err
+	}
+	return ocmSdkConn, nil
 }
