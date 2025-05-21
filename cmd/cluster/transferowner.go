@@ -69,7 +69,7 @@ var green *color.Color
 
 const transferOwnerCmdExample = `
   # Transfer ownership
-  osdctl cluster transfer-owner --new-owner "new_OCM_userName" --cluster-id 1kfmyclusteristhebesteverp8m --reason "transfer ownership per jira-id"
+  osdctl cluster transfer-owner --new-owner "$NEW_ACCOUNT" --old-owner "$OLD_ACCOUNT" --cluster-id 1kfmyclusteristhebesteverp8m --reason "transfer ownership per jira-id"
 `
 
 func newCmdTransferOwner(streams genericclioptions.IOStreams, globalOpts *globalflags.GlobalOptions) *cobra.Command {
@@ -311,6 +311,7 @@ func rolloutPods(clientset *kubernetes.Clientset, namespace, selector string) er
 func comparePullSecretAuths(pullSecret *corev1.Secret, expectedAuths map[string]*amv1.AccessTokenAuth) error {
 	var err error = nil
 	var psTokenAuth *amv1.AccessTokenAuth = nil
+
 	blue.Println("\nComparing pull-secret to expected auth sections...")
 	for akey, auth := range expectedAuths {
 		// Find the matching auth entry for this registry name in the cluster pull_secret data...
