@@ -940,13 +940,6 @@ func (o *transferOwnerOptions) run() error {
 
 	// Transfer ownership specific operations...
 
-	/*fmt.Printf("\nTransfer cluster: \t\t'%v' (%v)\n", externalClusterID, cluster.Name())
-	fmt.Printf("from user \t\t\t'%v' to '%v'\n", oldOwnerAccount.ID(), newOwnerAccountID)
-	fmt.Print("Is the above correct? Proceed with transfer? ")
-	if !utils.ConfirmPrompt() {
-		return nil
-	}*/
-
 	ok = validateOldOwner(oldOrganizationId, subscription, oldOwnerAccount)
 	if !ok {
 		fmt.Print("can't validate this is old owners cluster, this could be because of a previously failed run\n")
