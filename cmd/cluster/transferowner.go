@@ -388,6 +388,8 @@ func verifyClusterPullSecret(clientset *kubernetes.Clientset, expectedPullSecret
 		}
 
 		green.Println("Pull secret verification (by user) successful.")
+	} else {
+		fmt.Println("(Skipping display)")
 	}
 	return nil
 }
@@ -893,6 +895,8 @@ func (o *transferOwnerOptions) run() error {
 		if continueConfirmation != "yes" {
 			return fmt.Errorf("operation aborted by the user")
 		}
+	} else {
+		fmt.Println("(Skipping display)")
 	}
 
 	if o.hypershift {
@@ -950,8 +954,9 @@ func (o *transferOwnerOptions) run() error {
 
 	// Transfer ownership specific operations...
 
-	fmt.Printf("Transfer cluster: \t\t'%v' (%v)\n", externalClusterID, cluster.Name())
+	fmt.Printf("\nTransfer cluster: \t\t'%v' (%v)\n", externalClusterID, cluster.Name())
 	fmt.Printf("from user \t\t\t'%v' to '%v'\n", oldOwnerAccount.ID(), accountID)
+	fmt.Print("Is the above correct? Proceed with transfer? ")
 	if !utils.ConfirmPrompt() {
 		return nil
 	}

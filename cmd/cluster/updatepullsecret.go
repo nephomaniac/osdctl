@@ -30,6 +30,7 @@ func newCmdUpdatePullSecret(streams genericclioptions.IOStreams, globalOpts *glo
 	updatePullSecretCmd.Flags().StringVarP(&ops.clusterID, "cluster-id", "C", "", "The Internal Cluster ID/External Cluster ID/ Cluster Name")
 	updatePullSecretCmd.Flags().BoolVarP(&ops.dryrun, "dry-run", "d", false, "Dry-run - show all changes but do not apply them")
 	updatePullSecretCmd.Flags().StringVar(&ops.reason, "reason", "", "The reason for this command, which requires elevation, to be run (usually an OHSS or PD ticket)")
+	updatePullSecretCmd.Flags().StringVar(&ops.hiveConfigPath, "hive-config", "", "path to ocm config to be used for hive connections. (This is only needed when target cluster exists outside the 'prod' ocm env)")
 
 	_ = updatePullSecretCmd.MarkFlagRequired("cluster-id")
 	_ = updatePullSecretCmd.MarkFlagRequired("reason")
