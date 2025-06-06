@@ -161,13 +161,12 @@ func generateServiceLog(params serviceLogParameters, template string, dryRun boo
 // Wrapper providing additional info from SOP procedure
 func getOcmAccountWithHelpMessage(ocm *sdk.Connection, userName string) (*amv1.Account, error) {
 	account, err := utils.GetAccount(ocm, userName)
-
-	red.Fprintf(os.Stderr, "Could not get account for:'%s'. Error:'%s'\n", userName, err)
-	red.Fprintf(os.Stderr, "If 0 accounts were found, this may indicate '%s' has never logged on http://console.redhat.com/ .\n", userName)
-	red.Fprintf(os.Stderr, "Please confirm '%s' is correct. If correct, please ask this user to login at least once on http://console.redhat.com/.\n", userName)
-	red.Fprint(os.Stderr, "Note: It can take some time (up to ~1h) after the first login before the OCM database is updated.\n")
 	if err != nil {
-		return account, fmt.Errorf("could not get current owner's account, err:%w", err)
+		red.Fprintf(os.Stderr, "Could not get account for:'%s'. Error:'%s'\n", userName, err)
+		red.Fprintf(os.Stderr, "If 0 accounts were found, this may indicate '%s' has never logged on http://console.redhat.com/ .\n", userName)
+		red.Fprintf(os.Stderr, "Please confirm '%s' is correct. If correct, please ask this user to login at least once on http://console.redhat.com/.\n", userName)
+		red.Fprint(os.Stderr, "Note: It can take some time (up to ~1h) after the first login before the OCM database is updated.\n")
+		return account, fmt.Errorf("could not get current owner's account, err:'%w'", err)
 	}
 	return account, err
 }
@@ -639,7 +638,7 @@ func (o *transferOwnerOptions) run() error {
 	if o.doPullSecretOnly {
 		elevationReasons = append(elevationReasons, "Updating pull secret using osdctl")
 	} else {
-		elevationReasons = append(elevationReasons, fmt.Sprintf("Updating pull secret using osdctl to tranfer owner to %s", o.newOwnerName))
+		elevationReasons = append(elevationReasons, fmt.Sprintf("Updating pull secret using osdctl to transfer owner to %s", o.newOwnerName))
 	}
 	// Gather all required information
 	fmt.Printf("Gathering all required information for the cluster '%s'...\n", o.opDescription)
