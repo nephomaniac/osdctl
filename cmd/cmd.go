@@ -26,6 +26,7 @@ import (
 	"github.com/openshift/osdctl/cmd/cost"
 	"github.com/openshift/osdctl/cmd/dynatrace"
 	"github.com/openshift/osdctl/cmd/env"
+	githubcmd "github.com/openshift/osdctl/cmd/github"
 	"github.com/openshift/osdctl/cmd/hcp"
 	"github.com/openshift/osdctl/cmd/hive"
 	"github.com/openshift/osdctl/cmd/iampermissions"
@@ -94,6 +95,7 @@ func NewCmdRoot(streams genericclioptions.IOStreams) *cobra.Command {
 	rootCmd.AddCommand(cloudtrail.NewCloudtrailCmd())
 	rootCmd.AddCommand(cluster.NewCmdCluster(streams, kubeClient, globalOpts))
 	rootCmd.AddCommand(env.NewCmdEnv())
+	rootCmd.AddCommand(githubcmd.Cmd)
 	rootCmd.AddCommand(hive.NewCmdHive(streams, kubeClient))
 	rootCmd.AddCommand(jira.Cmd)
 	rootCmd.AddCommand(jumphost.NewCmdJumphost())
