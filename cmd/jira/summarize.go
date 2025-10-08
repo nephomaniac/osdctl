@@ -233,10 +233,8 @@ func (s *CommentSummarizer) formatCommentsForAI(comments []*jira.Comment, descri
 	// Add all comments
 	for i, comment := range comments {
 		author := "Unknown"
-		if comment.Author != nil {
-			if name := comment.Author.DisplayName; name != "" {
-				author = name
-			}
+		if comment.Author.DisplayName != "" {
+			author = comment.Author.DisplayName
 		}
 
 		created := comment.Created
