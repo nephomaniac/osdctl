@@ -11,6 +11,7 @@ import (
 	"github.com/manifoldco/promptui"
 	"github.com/openshift/osdctl/pkg/utils"
 	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
 	"golang.org/x/oauth2"
 )
 
@@ -59,16 +60,18 @@ var reviewPRCmd = &cobra.Command{
 		modelName, _ := cmd.Flags().GetString("model")
 		baseURL, _ := cmd.Flags().GetString("base-url")
 		skipPost, _ := cmd.Flags().GetBool("skip-post")
+		apiKey, _ := cmd.Flags().GetString("openai-key")
 
-		return ReviewPullRequest(prURL, autoPost, skipPost, modelName, baseURL)
+		return ReviewPullRequest(prURL, autoPost, skipPost, modelName, baseURL, apiKey)
 	},
 }
 
 func init() {
 	reviewPRCmd.Flags().Bool("auto-post", false, "Automatically post the review as a comment without prompting")
 	reviewPRCmd.Flags().Bool("skip-post", false, "Skip posting the review (just display it)")
-	reviewPRCmd.Flags().String("model", "", "AI model name (overrides MODEL_NAME env var)")
-	reviewPRCmd.Flags().String("base-url", "", "AI model provider base URL (overrides MODEL_PROVIDER_BASE_URL env var)")
+	reviewPRCmd.Flags().String("model", "", "AI model name (overrides model_name config and MODEL_NAME env var)")
+	reviewPRCmd.Flags().String("base-url", "", "AI model provider base URL (overrides model_provider_url config and MODEL_PROVIDER_BASE_URL env var)")
+	reviewPRCmd.Flags().String("openai-key", "", "OpenAI API key (overrides openai_key config and OPENAI_API_KEY env var)")
 }
 
 // PRInfo holds parsed pull request information
@@ -104,30 +107,42 @@ func parsePRURL(url string) (*PRInfo, error) {
 }
 
 // ReviewPullRequest fetches and reviews a GitHub pull request
-func ReviewPullRequest(prURL string, autoPost, skipPost bool, modelName, baseURL string) error {
+func ReviewPullRequest(prURL string, autoPost, skipPost bool, modelName, baseURL, apiKey string) error {
 	// Validate environment variables
 	githubToken := os.Getenv("GITHUB_TOKEN")
 	if githubToken == "" {
 		return fmt.Errorf("GITHUB_TOKEN environment variable is required")
 	}
 
-	apiKey := os.Getenv("OPENAI_API_KEY")
+	// Get API key - priority: flag > viper config > env var
 	if apiKey == "" {
-		return fmt.Errorf("OPENAI_API_KEY environment variable is required")
+		apiKey = viper.GetString("openai_key")
+		if apiKey == "" {
+			apiKey = os.Getenv("OPENAI_API_KEY")
+			if apiKey == "" {
+				return fmt.Errorf("OpenAI API key is required.\n\nPlease set it via:\n  - Config: osdctl config --key openai_key --value YOUR_KEY\n  - Env var: export OPENAI_API_KEY=YOUR_KEY\n  - Flag: --openai-key YOUR_KEY")
+			}
+		}
 	}
 
-	// Set AI model defaults
+	// Set AI model defaults - check viper config first, then env vars
 	if modelName == "" {
-		modelName = os.Getenv("MODEL_NAME")
+		modelName = viper.GetString("model_name")
 		if modelName == "" {
-			modelName = "mistral-small"
+			modelName = os.Getenv("MODEL_NAME")
+			if modelName == "" {
+				modelName = "mistral-small"
+			}
 		}
 	}
 
 	if baseURL == "" {
-		baseURL = os.Getenv("MODEL_PROVIDER_BASE_URL")
+		baseURL = viper.GetString("model_provider_url")
 		if baseURL == "" {
-			baseURL = "http://localhost:11434/v1"
+			baseURL = os.Getenv("MODEL_PROVIDER_BASE_URL")
+			if baseURL == "" {
+				baseURL = "http://localhost:11434/v1"
+			}
 		}
 	}
 
