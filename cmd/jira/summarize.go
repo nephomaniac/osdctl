@@ -6,8 +6,12 @@ import (
 	"strings"
 
 	"github.com/andygrunwald/go-jira"
+	"github.com/openshift/osdctl/internal/utils/globalflags"
 	"github.com/openshift/osdctl/pkg/utils"
 	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
+	"k8s.io/cli-runtime/pkg/genericclioptions"
+	cmdutil "k8s.io/kubectl/pkg/cmd/util"
 )
 
 const longSummarizeDescription = `
@@ -22,95 +26,127 @@ This command analyzes the ticket's description and all comments to provide a com
 The summary is formatted using JIRA wiki markup and can be posted as a comment to the ticket.
 
 Requirements:
-- OPENAI_API_KEY environment variable (API key for AI service)
-- MODEL_PROVIDER_BASE_URL environment variable (optional, defaults to http://localhost:11434/v1)
-- MODEL_NAME environment variable (optional, defaults to mistral-small)
+- OPENAI_KEY (API key for AI service, use cluster login token provided by console: https://console-openshift-console.apps.rosa.hcmaii01ue1.a9ro.p3.openshiftapps.com/dashboards)
+- MODEL_PROVIDER_URL (optional, defaults to http://localhost:11434/v1)
+- MODEL_NAME (optional, defaults to mistral-small)
 
 Example:
   osdctl jira summarize SREP-12345
   osdctl jira summarize SREP-12345 --post-comment
   osdctl jira summarize SREP-12345 --model gpt-4 --base-url https://api.openai.com/v1
 `
+const defaultModelUrl = "http://localhost:11434/v1"
 
-var summarizeCmd = &cobra.Command{
-	Use:   "summarize <ticket-key>",
-	Short: "Generate an AI-powered summary of a JIRA ticket",
-	Long:  longSummarizeDescription,
-	Args:  cobra.ExactArgs(1),
-	RunE: func(cmd *cobra.Command, args []string) error {
-		ticketKey := strings.ToUpper(args[0])
+type summarizeOptions struct {
+	postComment         bool
+	modelName           string
+	modelBaseUrl        string
+	apiKey              string
+	jiraToken           string
+	minCommentThreshold int
+	jiraID              string
+	jiraClient          utils.JiraClientInterface
 
-		postComment, _ := cmd.Flags().GetBool("post-comment")
-		modelName, _ := cmd.Flags().GetString("model")
-		baseURL, _ := cmd.Flags().GetString("base-url")
-		commentThreshold, _ := cmd.Flags().GetInt("comment-threshold")
-
-		return SummarizeTicket(ticketKey, postComment, modelName, baseURL, commentThreshold)
-	},
+	genericclioptions.IOStreams
+	GlobalOptions *globalflags.GlobalOptions
 }
 
-func init() {
-	summarizeCmd.Flags().Bool("post-comment", false, "Post the summary as a comment to the JIRA ticket")
-	summarizeCmd.Flags().String("model", "", "AI model name (overrides MODEL_NAME env var)")
-	summarizeCmd.Flags().String("base-url", "", "AI model provider base URL (overrides MODEL_PROVIDER_BASE_URL env var)")
-	summarizeCmd.Flags().Int("comment-threshold", 5, "Minimum number of comments required to generate summary")
+func newCmdSummarizeJira() *cobra.Command {
+	ops := summarizeOptions{}
+
+	var summarizeCmd = &cobra.Command{
+		Use:   "summarize <ticket-key>",
+		Short: "Generate an AI-powered summary of a JIRA ticket",
+		Long:  longSummarizeDescription,
+		Args:  cobra.NoArgs,
+		Run: func(cmd *cobra.Command, args []string) {
+			cmdutil.CheckErr(ops.SummarizeTicket())
+		},
+	}
+	summarizeCmd.Flags().StringVarP(&ops.jiraID, "jira-id", "j", "", "The Jira ticket ID to summarize")
+	summarizeCmd.Flags().StringVarP(&ops.modelBaseUrl, "model-url", "u", "", "AI model provider base URL (override 'model_provider_url' config and/or env var)")
+	summarizeCmd.Flags().StringVarP(&ops.apiKey, "openai-key", "a", "", "OpenAI key (override 'openai_key' config)")
+	summarizeCmd.Flags().StringVarP(&ops.jiraToken, "jira-token", "t", "", "overide 'jira_token' config, and/or JIRA_API_TOKEN env var")
+	summarizeCmd.Flags().StringVarP(&ops.modelName, "model", "m", "", "AI model name (override model_name config, and/or env var)")
+	summarizeCmd.Flags().IntVarP(&ops.minCommentThreshold, "comments-min", "c", 5, "Minimum number of comments required to generate summary")
+	summarizeCmd.Flags().BoolVarP(&ops.postComment, "post-comment", "p", false, "Post summary as comment in Jira ticket")
+	_ = summarizeCmd.MarkFlagRequired("jira-id")
+
+	return summarizeCmd
 }
 
 // SummarizeTicket generates an AI-powered summary of a JIRA ticket
-func SummarizeTicket(ticketKey string, postComment bool, modelName, baseURL string, commentThreshold int) error {
+func (o *summarizeOptions) SummarizeTicket() error {
+	//ticketKey string, postComment bool, modelName, baseURL string, commentThreshold int, jiratoken string
 	// Validate environment variables
-	apiKey := os.Getenv("OPENAI_API_KEY")
-	if apiKey == "" {
-		return fmt.Errorf("OPENAI_API_KEY environment variable is required")
-	}
+	var err error = nil
 
-	// Set defaults from environment or flags
-	if modelName == "" {
-		modelName = os.Getenv("MODEL_NAME")
-		if modelName == "" {
-			modelName = "mistral-small"
+	if o.apiKey == "" {
+		o.apiKey = viper.GetString("openai_key")
+		if o.apiKey == "" {
+			o.apiKey = os.Getenv("OPENAI_API_KEY")
+			if o.apiKey == "" {
+				return fmt.Errorf("OPENAI_API_KEY environment variable is required")
+			}
 		}
 	}
 
-	if baseURL == "" {
-		baseURL = os.Getenv("MODEL_PROVIDER_BASE_URL")
-		if baseURL == "" {
-			baseURL = "http://localhost:11434/v1"
+	// Set defaults from environment or flags
+	if o.modelName == "" {
+		o.modelName = viper.GetString("model_name")
+		if o.modelName == "" {
+			o.modelName = os.Getenv("MODEL_NAME")
+			if o.modelName == "" {
+				o.modelName = "mistral-small"
+			}
+		}
+	}
+
+	if o.modelBaseUrl == "" {
+		o.modelBaseUrl = viper.GetString("model_provider_url")
+		if o.modelBaseUrl == "" {
+			o.modelBaseUrl = os.Getenv("MODEL_PROVIDER_URL")
+			if o.modelBaseUrl == "" {
+				fmt.Fprintf(os.Stderr, "Model URL not found, using default %s\n", defaultModelUrl)
+				o.modelBaseUrl = defaultModelUrl
+			}
 		}
 	}
 
 	// Create JIRA client
-	jiraClient, err := utils.NewJiraClient("")
+	// JiraClient wrapper will attempt to read jira_token from osdctl config, and then env var
+	fmt.Printf("AHH token:'%s' \n", o.jiraToken)
+	o.jiraClient, err = utils.NewJiraClient(o.jiraToken)
 	if err != nil {
 		return fmt.Errorf("failed to create JIRA client: %w", err)
 	}
 
 	// Fetch the ticket
-	fmt.Printf("Fetching ticket %s...\n", ticketKey)
-	issue, err := getIssue(jiraClient, ticketKey)
+	fmt.Printf("Fetching ticket %s...\n", o.jiraID)
+	issue, err := getIssue(o.jiraClient, o.jiraID)
 	if err != nil {
-		return fmt.Errorf("failed to fetch ticket: %w", err)
+		return fmt.Errorf("failed to fetch ticket, err: %w", err)
 	}
 
 	// Get all comments
-	comments, err := getComments(jiraClient, ticketKey)
+	comments, err := getComments(o.jiraClient, o.jiraID)
 	if err != nil {
 		return fmt.Errorf("failed to fetch comments: %w", err)
 	}
 
-	fmt.Printf("Found %d comments on ticket %s\n", len(comments), ticketKey)
+	fmt.Printf("Found %d comments on ticket %s\n", len(comments), o.jiraID)
 
 	// Check comment threshold
-	if len(comments) < commentThreshold {
-		return fmt.Errorf("ticket has only %d comments (threshold is %d)", len(comments), commentThreshold)
+	if len(comments) < o.minCommentThreshold {
+		return fmt.Errorf("ticket has only %d comments (threshold is %d)", len(comments), o.minCommentThreshold)
 	}
 
 	// Initialize AI summarizer
-	summarizer := NewCommentSummarizer(apiKey, modelName, baseURL, commentThreshold)
+	summarizer := NewCommentSummarizer(o.apiKey, o.modelName, o.modelBaseUrl, o.minCommentThreshold)
 
 	// Generate summary
-	fmt.Printf("Generating AI summary using model %s...\n", modelName)
-	summary, err := summarizer.SummarizeComments(comments, ticketKey, issue.Fields.Description)
+	fmt.Printf("Generating AI summary using model %s...\n", o.modelName)
+	summary, err := summarizer.SummarizeComments(comments, o.jiraID, issue.Fields.Description)
 	if err != nil {
 		return fmt.Errorf("failed to generate summary: %w", err)
 	}
@@ -120,23 +156,23 @@ func SummarizeTicket(ticketKey string, postComment bool, modelName, baseURL stri
 	}
 
 	// Format the final output
-	finalSummary := formatSummaryForJira(summary, ticketKey, len(comments))
+	finalSummary := formatSummaryForJira(summary, o.jiraID, len(comments))
 
 	// Print summary to console
 	fmt.Println("\n" + strings.Repeat("=", 80))
-	fmt.Println("AI-Generated Summary for", ticketKey)
+	fmt.Println("AI-Generated Summary for", o.jiraID)
 	fmt.Println(strings.Repeat("=", 80))
 	fmt.Println(finalSummary)
 	fmt.Println(strings.Repeat("=", 80))
 
 	// Optionally post as comment
-	if postComment {
-		fmt.Printf("\nPosting summary as comment to %s...\n", ticketKey)
-		err = postCommentToJira(jiraClient, ticketKey, finalSummary)
+	if o.postComment {
+		fmt.Printf("\nPosting summary as comment to %s...\n", o.jiraID)
+		err = postCommentToJira(o.jiraClient, o.jiraID, finalSummary)
 		if err != nil {
 			return fmt.Errorf("failed to post comment: %w", err)
 		}
-		fmt.Printf("Summary successfully posted to %s/browse/%s\n", utils.JiraBaseURL, ticketKey)
+		fmt.Printf("Summary successfully posted to %s/browse/%s\n", utils.JiraBaseURL, o.jiraID)
 	}
 
 	return nil

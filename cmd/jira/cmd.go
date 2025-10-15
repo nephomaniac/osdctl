@@ -16,7 +16,7 @@ var Cmd = &cobra.Command{
 func init() {
 	Cmd.AddCommand(quickTaskCmd)
 	Cmd.AddCommand(createHandoverAnnouncmentCmd)
-	Cmd.AddCommand(summarizeCmd)
+	Cmd.AddCommand(newCmdSummarizeJira())
 
 	createHandoverAnnouncmentCmd.Flags().String("summary", "", "Enter Summary/Title for the Announcment")
 	createHandoverAnnouncmentCmd.Flags().String("description", "", "Enter Description for the Announcment")

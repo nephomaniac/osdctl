@@ -105,6 +105,14 @@ func (c *OpenAIClient) ChatCompletion(systemPrompt, userPrompt, model string) (s
 
 	// Check for HTTP errors
 	if resp.StatusCode != http.StatusOK {
+		// Check for authentication errors
+		if resp.StatusCode == http.StatusUnauthorized {
+			return "", fmt.Errorf("authentication failed (status 401): Invalid or missing API key.\n\nPlease check your OpenAI key configuration:\n  - Set via config: osdctl config --key openai_key --value YOUR_KEY\n  - Set via env var: export OPENAI_API_KEY=YOUR_KEY\n  - Set via flag: --openai-key YOUR_KEY\n\nAPI response: %s", string(body))
+		}
+		// Check for forbidden errors
+		if resp.StatusCode == http.StatusForbidden {
+			return "", fmt.Errorf("authentication failed (status 403): API key does not have permission.\n\nPlease verify your OpenAI key has the correct permissions.\nAPI response: %s", string(body))
+		}
 		return "", fmt.Errorf("API returned status %d: %s", resp.StatusCode, string(body))
 	}
 
