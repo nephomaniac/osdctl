@@ -5,7 +5,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/openshift/osdctl/pkg/printer"
+	"github.com/fatih/color"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 	"gopkg.in/yaml.v3"
@@ -151,8 +151,7 @@ func getConfigValue(key string) error {
 
 	value := viper.Get(key)
 	source := getConfigSource(key)
-	printer.PrintfGreen("\"%s\": \"%v\" ", key, value)
-	fmt.Printf("(source: %s)\n", source)
+	fmt.Printf("\"%s\": \"%v\" '%s'\n", key, value, color.CyanString(fmt.Sprintf("source: %s)", source)))
 	return nil
 }
 
@@ -161,10 +160,9 @@ func showConfig(cmd *cobra.Command, args []string) error {
 	// Print the config file path
 	configFile := viper.ConfigFileUsed()
 	if configFile != "" {
-		fmt.Printf("Using config file:")
-		printer.PrintfGreen(" '%s'\n\n", configFile)
+		fmt.Printf("Using config file: %s\n\n", color.HiGreenString(configFile))
 	}
-	fmt.Printf("VIPER SETTINGS:")
+	fmt.Println("VIPER SETTINGS:")
 
 	// Get all keys to check their sources
 	allKeys := viper.AllKeys()
@@ -173,8 +171,7 @@ func showConfig(cmd *cobra.Command, args []string) error {
 	for _, key := range allKeys {
 		value := viper.Get(key)
 		source := getConfigSource(key)
-		printer.PrintfGreen("%s: %v ", key, value)
-		fmt.Printf("(source: %s)\n", source)
+		fmt.Printf("\"%s\": \"%v\" '%s'\n", key, value, color.CyanString(fmt.Sprintf("source: %s)", source)))
 	}
 
 	return nil

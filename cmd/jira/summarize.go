@@ -112,10 +112,12 @@ func (o *summarizeOptions) SummarizeTicket() error {
 			}
 		}
 	}
+	fmt.Printf("Using model url:'%s'\n", o.modelBaseUrl)
+	fmt.Printf("Using model name:'%s'\n", o.modelName)
+	fmt.Printf("Using openai key:'%s'\n", o.apiKey)
 
 	// Create JIRA client
 	// JiraClient wrapper will attempt to read jira_token from osdctl config, and then env var
-	fmt.Printf("AHH token:'%s' \n", o.jiraToken)
 	o.jiraClient, err = utils.NewJiraClient(o.jiraToken)
 	if err != nil {
 		return fmt.Errorf("failed to create JIRA client: %w", err)

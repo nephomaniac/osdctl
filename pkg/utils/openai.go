@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"strings"
 	"time"
 )
 
@@ -105,8 +107,10 @@ func (c *OpenAIClient) ChatCompletion(systemPrompt, userPrompt, model string) (s
 
 	// Check for HTTP errors
 	if resp.StatusCode != http.StatusOK {
+		fmt.Fprintf(os.Stderr, "OpenAI request failed. URL:'%s'\n\nRequest data...\n'%s'\n", url, jsonData)
 		// Check for authentication errors
 		if resp.StatusCode == http.StatusUnauthorized {
+			fmt.Fprintf(os.Stderr, "Authorization Headers...\n'%s'\n", strings.Join(req.Header["Authorization"], ","))
 			return "", fmt.Errorf("authentication failed (status 401): Invalid or missing API key.\n\nPlease check your OpenAI key configuration:\n  - Set via config: osdctl config --key openai_key --value YOUR_KEY\n  - Set via env var: export OPENAI_API_KEY=YOUR_KEY\n  - Set via flag: --openai-key YOUR_KEY\n\nAPI response: %s", string(body))
 		}
 		// Check for forbidden errors
