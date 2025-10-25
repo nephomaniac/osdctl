@@ -20,20 +20,31 @@ Query Jira for all tickets that contain a comment or update by a specific user w
 This command searches for Jira tickets where the specified user has:
 - Added comments
 - Updated the ticket
-- Made any changes within the specified number of days
+- Made any changes within the specified time period
+
+You can specify the time period in two ways:
+1. Using --days to search back N days from today
+2. Using --start-date and --end-date to specify a custom date range
 
 Requirements:
 - JIRA_API_TOKEN environment variable or jira_token config setting
 
-Example:
+Examples:
+  # Search last 7 days
   osdctl jira user-activity --user john.doe --days 7
-  osdctl jira user-activity -u jane.smith -d 30
+
+  # Search with date range (format: YYYY-MM-DD)
+  osdctl jira user-activity -u jane.smith --start-date 2025-01-01 --end-date 2025-01-31
+
+  # Show detailed information
   osdctl jira user-activity --user john.doe --days 14 --detailed
 `
 
 type userActivityOptions struct {
 	username   string
 	days       int
+	startDate  string
+	endDate    string
 	detailed   bool
 	jiraToken  string
 	jiraClient utils.JiraClientInterface
@@ -56,7 +67,9 @@ func newCmdUserActivity() *cobra.Command {
 	}
 
 	userActivityCmd.Flags().StringVarP(&ops.username, "user", "u", "", "Jira username to search for")
-	userActivityCmd.Flags().IntVarP(&ops.days, "days", "d", 30, "Number of days to search back from today")
+	userActivityCmd.Flags().IntVarP(&ops.days, "days", "d", 0, "Number of days to search back from today (mutually exclusive with start-date/end-date)")
+	userActivityCmd.Flags().StringVar(&ops.startDate, "start-date", "", "Start date for search window (YYYY-MM-DD)")
+	userActivityCmd.Flags().StringVar(&ops.endDate, "end-date", "", "End date for search window (YYYY-MM-DD)")
 	userActivityCmd.Flags().BoolVarP(&ops.detailed, "detailed", "", false, "Show detailed ticket information including summaries")
 	userActivityCmd.Flags().StringVarP(&ops.jiraToken, "jira-token", "t", "", "Override jira_token config and/or JIRA_API_TOKEN env var")
 
@@ -74,9 +87,22 @@ func (o *userActivityOptions) QueryUserActivity() error {
 		return fmt.Errorf("username is required")
 	}
 
-	if o.days <= 0 {
-		return fmt.Errorf("days must be a positive number")
+	// Validate date options - either days OR date range, not both
+	useDays := o.days > 0
+	useDateRange := o.startDate != "" || o.endDate != ""
+
+	if useDays && useDateRange {
+		return fmt.Errorf("cannot use --days together with --start-date/--end-date; choose one approach")
 	}
+
+	if !useDays && !useDateRange {
+		// Default to 30 days if nothing specified
+		o.days = 30
+		useDays = true
+	}
+
+	var startDate, endDate time.Time
+	var jql string
 
 	// Create JIRA client
 	o.jiraClient, err = utils.NewJiraClient(o.jiraToken)
@@ -84,9 +110,23 @@ func (o *userActivityOptions) QueryUserActivity() error {
 		return fmt.Errorf("failed to create JIRA client: %w", err)
 	}
 
-	// Build JQL query
-	jql := buildUserActivityJQL(o.username, o.days)
-	fmt.Printf("Searching for tickets with activity by user '%s' in the last %d days...\n", o.username, o.days)
+	// Build JQL query based on mode
+	if useDateRange {
+		// Parse and validate date range
+		startDate, endDate, err = o.validateDateRange()
+		if err != nil {
+			return err
+		}
+
+		jql = buildUserActivityJQLWithDateRange(o.username, startDate, endDate)
+		fmt.Printf("Searching for tickets with activity by user '%s' from %s to %s...\n",
+			o.username, startDate.Format("2006-01-02"), endDate.Format("2006-01-02"))
+	} else {
+		// Use days-based query
+		jql = buildUserActivityJQL(o.username, o.days)
+		fmt.Printf("Searching for tickets with activity by user '%s' in the last %d days...\n", o.username, o.days)
+	}
+
 	fmt.Printf("JQL: %s\n\n", jql)
 
 	// Search for issues
@@ -97,7 +137,12 @@ func (o *userActivityOptions) QueryUserActivity() error {
 
 	// Display results
 	if len(issues) == 0 {
-		fmt.Printf("No tickets found with activity by user '%s' in the last %d days.\n", o.username, o.days)
+		if useDateRange {
+			fmt.Printf("No tickets found with activity by user '%s' from %s to %s.\n",
+				o.username, startDate.Format("2006-01-02"), endDate.Format("2006-01-02"))
+		} else {
+			fmt.Printf("No tickets found with activity by user '%s' in the last %d days.\n", o.username, o.days)
+		}
 		return nil
 	}
 
@@ -112,6 +157,34 @@ func (o *userActivityOptions) QueryUserActivity() error {
 	return nil
 }
 
+// validateDateRange validates and parses the start and end dates
+func (o *userActivityOptions) validateDateRange() (time.Time, time.Time, error) {
+	const dateFormat = "2006-01-02"
+
+	if o.startDate == "" {
+		return time.Time{}, time.Time{}, fmt.Errorf("start-date is required when using date range")
+	}
+	if o.endDate == "" {
+		return time.Time{}, time.Time{}, fmt.Errorf("end-date is required when using date range")
+	}
+
+	startDate, err := time.Parse(dateFormat, o.startDate)
+	if err != nil {
+		return time.Time{}, time.Time{}, fmt.Errorf("invalid start-date format (expected YYYY-MM-DD): %w", err)
+	}
+
+	endDate, err := time.Parse(dateFormat, o.endDate)
+	if err != nil {
+		return time.Time{}, time.Time{}, fmt.Errorf("invalid end-date format (expected YYYY-MM-DD): %w", err)
+	}
+
+	if startDate.After(endDate) {
+		return time.Time{}, time.Time{}, fmt.Errorf("start-date cannot be after end-date")
+	}
+
+	return startDate, endDate, nil
+}
+
 // buildUserActivityJQL constructs a JQL query to find tickets with user activity
 func buildUserActivityJQL(username string, days int) string {
 	// JQL to find tickets where the user has activity within the time period
@@ -124,6 +197,24 @@ func buildUserActivityJQL(username string, days int) string {
 		`comment ~ "%s" AND updated >= -%dd ORDER BY updated DESC`,
 		username,
 		days,
+	)
+	return jql
+}
+
+// buildUserActivityJQLWithDateRange constructs a JQL query with specific date range
+func buildUserActivityJQLWithDateRange(username string, startDate, endDate time.Time) string {
+	// Jira JQL date format is YYYY-MM-DD or YYYY/MM/DD
+	// We use the dash format for consistency
+	startDateStr := startDate.Format("2006-01-02")
+	endDateStr := endDate.Format("2006-01-02")
+
+	// Build JQL with date range
+	// updated >= startDate AND updated <= endDate
+	jql := fmt.Sprintf(
+		`comment ~ "%s" AND updated >= "%s" AND updated <= "%s" ORDER BY updated DESC`,
+		username,
+		startDateStr,
+		endDateStr,
 	)
 	return jql
 }
