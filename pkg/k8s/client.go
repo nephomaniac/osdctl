@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 
+	sdk "github.com/openshift-online/ocm-sdk-go"
 	bplogin "github.com/openshift/backplane-cli/cmd/ocm-backplane/login"
 	bpconfig "github.com/openshift/backplane-cli/pkg/cli/config"
 	bputils "github.com/openshift/backplane-cli/pkg/utils"
@@ -162,6 +163,23 @@ func NewRestConfig(clusterID string) (*rest.Config, error) {
 	return cfg, nil
 }
 
+func NewWithConn(clusterID string, options client.Options, ocmConn *sdk.Connection) (client.Client, error) {
+	if ocmConn == nil {
+		return nil, fmt.Errorf("nil OCM sdk connection provided to NewWithConn()")
+	}
+	bp, err := bpconfig.GetBackplaneConfigurationWithConn(ocmConn)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load backplane-cli config: %v", err)
+	}
+
+	cfg, err := bplogin.GetRestConfigWithConn(bp, ocmConn, clusterID)
+	if err != nil {
+		return nil, err
+	}
+	setRuntimeLoggerDiscard()
+	return client.New(cfg, options)
+}
+
 func NewAsBackplaneClusterAdmin(clusterID string, options client.Options, elevationReasons ...string) (client.Client, error) {
 	bp, err := bpconfig.GetBackplaneConfiguration()
 	if err != nil {
@@ -169,6 +187,23 @@ func NewAsBackplaneClusterAdmin(clusterID string, options client.Options, elevat
 	}
 
 	cfg, err := bplogin.GetRestConfigAsUser(bp, clusterID, "backplane-cluster-admin", elevationReasons...)
+	if err != nil {
+		return nil, err
+	}
+	setRuntimeLoggerDiscard()
+	return client.New(cfg, options)
+}
+
+func NewAsBackplaneClusterAdminWithConn(clusterID string, options client.Options, ocmConn *sdk.Connection, elevationReasons ...string) (client.Client, error) {
+	if ocmConn == nil {
+		return nil, fmt.Errorf("nil OCM sdk connection provided to NewAsBackplaneClusterAdminWithConn()")
+	}
+	bp, err := bpconfig.GetBackplaneConfigurationWithConn(ocmConn)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load backplane-cli config: %v", err)
+	}
+
+	cfg, err := bplogin.GetRestConfigAsUserWithConn(bp, ocmConn, clusterID, "backplane-cluster-admin", elevationReasons...)
 	if err != nil {
 		return nil, err
 	}
