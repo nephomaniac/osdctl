@@ -187,7 +187,7 @@ func (o *testHiveLoginOptions) run() error {
 		hiveOCM, err = hiveBuilder.Build()
 		//hiveOCM, err = utils.OCMSdkConnFromFilePath(o.hiveOcmConfigPath)
 		if err != nil {
-			fmt.Printf("Error connecting to OCM env using config at: '%s'\nErr:%w", o.hiveOcmConfigPath, err)
+			fmt.Printf("Error connecting to OCM env using config at: '%s'\nErr:%v", o.hiveOcmConfigPath, err)
 			return err
 		}
 		fmt.Printf("Built OCM config and connection from provided config inputs\n")
