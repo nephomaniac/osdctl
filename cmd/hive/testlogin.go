@@ -193,7 +193,7 @@ func (o *testHiveLoginOptions) run() error {
 	}
 
 	printDiv()
-	hiveCluster, err = utils.GetHiveClusterWithConns(clusterID, ocmClient, hiveOCM)
+	hiveCluster, err = utils.GetHiveClusterWithConn(clusterID, ocmClient, hiveOCM)
 	if err != nil {
 		fmt.Printf("Failed to fetch hive cluster with provided OCM conneciton, err:'%v'", err)
 		return err

@@ -172,8 +172,8 @@ func GenerateQuery(clusterIdentifier string) string {
 	}
 }
 
-// Finds the OCM Configuration file and returns the path to it
-// Taken wholesale from	openshift-online/ocm-cli
+// Finds the OCM Configuration file and returns the path to it.
+// ( Taken wholesale from openshift-online/ocm-cli )
 func getOCMConfigLocation() (string, error) {
 	if ocmconfig := os.Getenv("OCM_CONFIG"); ocmconfig != "" {
 		return ocmconfig, nil
@@ -202,6 +202,7 @@ func getOCMConfigLocation() (string, error) {
 	return path, nil
 }
 
+// Exported function fetch and return OCM config
 func GetOCMConfigFromEnv() (*ocmConfig.Config, error) {
 	return loadOCMConfig()
 }
@@ -249,6 +250,7 @@ func loadOCMConfig() (*ocmConfig.Config, error) {
 	return cfg, nil
 }
 
+/*
 func getOcmConfiguration(ocmConfigLoader func() (*ocmConfig.Config, error)) (*ocmConfig.Config, error) {
 	tokenEnv := os.Getenv("OCM_TOKEN")
 	urlEnv := os.Getenv("OCM_URL")
@@ -279,7 +281,7 @@ func getOcmConfiguration(ocmConfigLoader func() (*ocmConfig.Config, error)) (*oc
 	}
 
 	return config, nil
-}
+}*/
 
 // Creates a connection to OCM
 func CreateConnection() (*sdk.Connection, error) {
@@ -480,7 +482,7 @@ func GetHiveCluster(clusterId string) (*cmv1.Cluster, error) {
 // in the same OCM env as Hive (prod), separate OCM SDK connections
 // can be provided for accessing each. If nil is provided a temporary connection using
 // the default OCM env vars will be made.
-func GetHiveClusterWithConns(clusterId string, clusterOCM *sdk.Connection, hiveOCM *sdk.Connection) (*cmv1.Cluster, error) {
+func GetHiveClusterWithConn(clusterId string, clusterOCM *sdk.Connection, hiveOCM *sdk.Connection) (*cmv1.Cluster, error) {
 	var err error = nil
 	if clusterOCM == nil {
 		clusterOCM, err = CreateConnection()

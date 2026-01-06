@@ -163,6 +163,9 @@ func NewRestConfig(clusterID string) (*rest.Config, error) {
 	return cfg, nil
 }
 
+// Create Backplane connection to a provided cluster, using a provided ocm sdk connection
+// This is intended to allow backplane connections to multiple clusters which exist in different
+// ocm environments by allowing the caller to provide an ocm connection to the function.
 func NewWithConn(clusterID string, options client.Options, ocmConn *sdk.Connection) (client.Client, error) {
 	if ocmConn == nil {
 		return nil, fmt.Errorf("nil OCM sdk connection provided to NewWithConn()")
@@ -194,6 +197,9 @@ func NewAsBackplaneClusterAdmin(clusterID string, options client.Options, elevat
 	return client.New(cfg, options)
 }
 
+// Create Backplane connection as cluster admin to a provided cluster, using a provided ocm sdk connection
+// This is intended to allow backplane connections to multiple clusters which exist in different
+// ocm environments by allowing the caller to provide an ocm connection to the function.
 func NewAsBackplaneClusterAdminWithConn(clusterID string, options client.Options, ocmConn *sdk.Connection, elevationReasons ...string) (client.Client, error) {
 	if ocmConn == nil {
 		return nil, fmt.Errorf("nil OCM sdk connection provided to NewAsBackplaneClusterAdminWithConn()")
