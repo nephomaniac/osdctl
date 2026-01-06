@@ -16,6 +16,7 @@ import (
 	"github.com/openshift/osdctl/pkg/printer"
 	"github.com/openshift/osdctl/pkg/utils"
 	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	cmdutil "k8s.io/kubectl/pkg/cmd/util"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -116,7 +117,19 @@ func getClusterDeployment(hiveKubeClient client.Client, clusterID string) (cd hi
 }
 
 func (o *testHiveLoginOptions) run() error {
-	o.reason = "OSD-28241, testing osdctl client with cluster admin"
+
+	if len(o.hiveOcmURL) > 0 {
+		fmt.Printf("Using Hive OCM URL set in args:'%s'\n", o.hiveOcmURL)
+	} else {
+		o.hiveOcmURL = viper.GetString("hive_ocm_url")
+		if len(o.hiveOcmURL) > 0 {
+			fmt.Printf("Got Hive OCM URL from viper vars:'%s'\n", o.hiveOcmURL)
+		} else {
+			fmt.Printf("No 'separate' Hive OCM URL set, using defaults set for target cluster.\n")
+		}
+	}
+
+	o.reason = "Testing osdctl clients with cluster admin"
 	var hiveOCM *sdk.Connection = nil
 	var hiveOCMCfg *ocmConfig.Config = nil
 	var hiveCluster *v1.Cluster = nil
@@ -284,12 +297,13 @@ func (o *testHiveLoginOptions) run() error {
 	if err != nil {
 		return err
 	}
-	podList, err := kubeClientSet.CoreV1().Pods("openshift-monitoring").List(context.TODO(), metav1.ListOptions{})
+	OpenshiftMonitoringNamespace := "openshift-monitoring"
+	podList, err := kubeClientSet.CoreV1().Pods(OpenshiftMonitoringNamespace).List(context.TODO(), metav1.ListOptions{})
 	if err != nil {
 		fmt.Printf("ClientSet list 'openshift-monitoring' pods failed, err:'%v'\n", err)
 		return err
 	}
-	fmt.Printf("Got %d pods\n", len(podList.Items))
+	fmt.Printf("Got %d pods in namespace:'%s' :\n", len(podList.Items), OpenshiftMonitoringNamespace)
 	for i, pod := range podList.Items {
 		fmt.Printf("Got pod (%d/%d): '%s/%s' \n", i, len(podList.Items), pod.Namespace, pod.Name)
 	}
