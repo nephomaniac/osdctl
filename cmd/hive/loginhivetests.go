@@ -396,9 +396,9 @@ func testGetKubeConfigAndClientWithConnAdmin(clusterID string, ocmClient *sdk.Co
 	return nil
 }
 
-// testGetHiveBPWithoutElevation tests GetHiveBPForCluster() without elevation
+// testGetHiveBPWithoutElevation tests GetHiveBPClientForCluster() without elevation
 func testGetHiveBPWithoutElevation(clusterID, hiveOcmURL string) error {
-	fmt.Printf("Testing GetHiveBPForCluster() hive backplane connection w/o elevation\n")
+	fmt.Printf("Testing GetHiveBPClientForCluster() hive backplane connection w/o elevation\n")
 	hiveBP, err := utils.GetHiveBPClientForCluster(clusterID, client.Options{}, "", hiveOcmURL)
 	if err != nil {
 		return err
@@ -408,14 +408,14 @@ func testGetHiveBPWithoutElevation(clusterID, hiveOcmURL string) error {
 		return err
 	}
 
-	fmt.Println("Create and test GetHiveBPForCluster() without elevation reason - PASS")
+	fmt.Println("Create and test GetHiveBPClientForCluster() without elevation reason - PASS")
 	printDiv()
 	return nil
 }
 
-// testGetHiveBPWithElevation tests GetHiveBPForCluster() with elevation
+// testGetHiveBPWithElevation tests GetHiveBPClientForCluster() with elevation
 func testGetHiveBPWithElevation(clusterID, reason, hiveOcmURL string) error {
-	fmt.Printf("Testing GetHiveBPForCluster() hive backplane connection w/o elevation\n")
+	fmt.Printf("Testing GetHiveBPClientForCluster() hive backplane connection with elevation\n")
 	hiveBP, err := utils.GetHiveBPClientForCluster(clusterID, client.Options{}, reason, hiveOcmURL)
 	if err != nil {
 		return err
@@ -431,7 +431,7 @@ func testGetHiveBPWithElevation(clusterID, reason, hiveOcmURL string) error {
 	}
 
 	fmt.Printf("Fetched ClusterDeployment:'%s/%s' for cluster:'%s' from HIVE using elevated client\n", clusterDep.Namespace, clusterDep.Name, clusterID)
-	fmt.Println("Create and test GetHiveBPForCluster() with elevation reason - PASS")
+	fmt.Println("Create and test GetHiveBPClientForCluster() with elevation reason - PASS")
 	printDiv()
 	return nil
 }
