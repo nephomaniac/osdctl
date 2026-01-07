@@ -22,8 +22,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-// testHiveLoginOptions defines the struct for running health command
-// This command requires the ocm API Token https://cloud.redhat.com/openshift/token be available in the OCM_TOKEN env variable.
+// testHiveLoginOptions defines the struct for running ocm and backplane client tests
 
 type testHiveLoginOptions struct {
 	clusterID         string
@@ -35,12 +34,32 @@ type testHiveLoginOptions struct {
 	reason            string
 }
 
-// newCmdHealth implements the health command to describe number of running instances in cluster and the expected number of nodes
+const longDescription = `
+This test utility attempts to exercise and validate functions related to
+OCM and backplane client connections. 
+	
+This test utiltiy can be run against an	OSD/Rosa Classic target cluster, and will attempt 
+OCM and kube client connections and requests for both the target cluster and the 
+Hive cluster servicing the target cluster. 
+	
+This test utility allows for the target cluster to exist in a separate OCM 
+environment (ie integration, staging) from the hive cluster (ie production).
+
+The default OCM environment vars should be set for the target cluster. 
+If the target cluster exists outside of the OCM 'production' environment, the user 
+has the option to provide the production OCM config (with valid token set), 
+or provide the production OCM API url as a command arguement, or set the value in the osdctl 
+config yaml file (ie: "hive_ocm_url: https://api.openshift.com" ).
+`
+
+// Defines command to run through series of tests to validate existing and new and legacy
+// ocm + backplane client functions
 func newCmdTestHiveLogin() *cobra.Command {
 	ops := newtestHiveLoginOptions()
 	testHiveLoginCmd := &cobra.Command{
 		Use:               "hive-login",
 		Short:             "Test Login into both Target Cluster and supporting Hive Cluster.",
+		Long:              longDescription,
 		Args:              cobra.NoArgs,
 		DisableAutoGenTag: true,
 		Run: func(cmd *cobra.Command, args []string) {
