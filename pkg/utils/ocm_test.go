@@ -73,9 +73,10 @@ func TestGetOcmConfigFromFilePath(t *testing.T) {
 		setupFunc   func(t *testing.T) string
 		wantErr     bool
 		errContains string
+		checkConfig func(*testing.T, *ocmConfig.Config)
 	}{
 		{
-			// Test that a valid OCM config file is successfully parsed and loaded
+			// Test that a valid OCM config file is successfully parsed and loaded with correct values
 			name: "valid config file",
 			setupFunc: func(t *testing.T) string {
 				tmpDir := t.TempDir()
@@ -97,6 +98,27 @@ func TestGetOcmConfigFromFilePath(t *testing.T) {
 				return configFile
 			},
 			wantErr: false,
+			checkConfig: func(t *testing.T, cfg *ocmConfig.Config) {
+				if cfg == nil {
+					t.Error("expected non-nil config")
+					return
+				}
+				if cfg.AccessToken != "test-access-token" {
+					t.Errorf("expected AccessToken 'test-access-token', got '%s'", cfg.AccessToken)
+				}
+				if cfg.RefreshToken != "test-refresh-token" {
+					t.Errorf("expected RefreshToken 'test-refresh-token', got '%s'", cfg.RefreshToken)
+				}
+				if cfg.URL != "https://api.openshift.com" {
+					t.Errorf("expected URL 'https://api.openshift.com', got '%s'", cfg.URL)
+				}
+				if cfg.ClientID != "test-client-id" {
+					t.Errorf("expected ClientID 'test-client-id', got '%s'", cfg.ClientID)
+				}
+				if cfg.ClientSecret != "test-client-secret" {
+					t.Errorf("expected ClientSecret 'test-client-secret', got '%s'", cfg.ClientSecret)
+				}
+			},
 		},
 		{
 			// Test that attempting to load a non-existent file returns an appropriate error
@@ -153,6 +175,9 @@ func TestGetOcmConfigFromFilePath(t *testing.T) {
 				}
 				if cfg == nil {
 					t.Errorf("GetOcmConfigFromFilePath() returned nil config")
+				}
+				if tt.checkConfig != nil {
+					tt.checkConfig(t, cfg)
 				}
 			}
 		})
@@ -532,11 +557,35 @@ func TestCreateConnectionWithUrl(t *testing.T) {
 			wantErr:     true,
 			errContains: "invalid OCM_URL found",
 		},
+		{
+			// Test that 'production' alias is recognized and does not return invalid alias error
+			// Note: May succeed or fail based on available OCM config; we're testing alias validation
+			name:        "production alias recognized",
+			ocmUrl:      "production",
+			wantErr:     false, // Should not fail with "invalid alias" error
+			errContains: "",
+		},
+		{
+			// Test that 'staging' alias is recognized and does not return invalid alias error
+			// Note: May succeed or fail based on available OCM config; we're testing alias validation
+			name:        "staging alias recognized",
+			ocmUrl:      "staging",
+			wantErr:     false, // Should not fail with "invalid alias" error
+			errContains: "",
+		},
+		{
+			// Test that 'integration' alias is recognized and does not return invalid alias error
+			// Note: May succeed or fail based on available OCM config; we're testing alias validation
+			name:        "integration alias recognized",
+			ocmUrl:      "integration",
+			wantErr:     false, // Should not fail with "invalid alias" error
+			errContains: "",
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := CreateConnectionWithUrl(tt.ocmUrl)
+			conn, err := CreateConnectionWithUrl(tt.ocmUrl)
 			if tt.wantErr {
 				if err == nil {
 					t.Errorf("CreateConnectionWithUrl() expected error but got none")
@@ -546,6 +595,9 @@ func TestCreateConnectionWithUrl(t *testing.T) {
 			} else {
 				if err != nil {
 					t.Errorf("CreateConnectionWithUrl() unexpected error = %v", err)
+				}
+				if conn != nil {
+					defer conn.Close()
 				}
 			}
 		})

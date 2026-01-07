@@ -26,6 +26,14 @@ func TestNewWithConn(t *testing.T) {
 			ocmConn:   nil,
 			wantErr:   true,
 		},
+		{
+			// Test that passing an empty cluster ID with nil connection returns an error
+			name:      "empty cluster ID with nil connection",
+			clusterID: "",
+			options:   client.Options{},
+			ocmConn:   nil,
+			wantErr:   true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -76,6 +84,15 @@ func TestNewAsBackplaneClusterAdminWithConn(t *testing.T) {
 			options:          client.Options{},
 			ocmConn:          nil,
 			elevationReasons: nil,
+			wantErr:          true,
+		},
+		{
+			// Test that passing an empty cluster ID with nil connection returns an error
+			name:             "empty cluster ID with nil connection",
+			clusterID:        "",
+			options:          client.Options{},
+			ocmConn:          nil,
+			elevationReasons: []string{"testing"},
 			wantErr:          true,
 		},
 	}

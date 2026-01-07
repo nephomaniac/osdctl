@@ -34,6 +34,14 @@ func TestGetKubeConfigAndClientWithConn(t *testing.T) {
 			elevationReasons: []string{"testing"},
 			wantErr:          true,
 		},
+		{
+			// Test that passing an empty cluster ID with nil connection returns an error
+			name:             "empty cluster ID with nil connection",
+			clusterID:        "",
+			ocmConn:          nil,
+			elevationReasons: nil,
+			wantErr:          true,
+		},
 	}
 
 	for _, tt := range tests {
