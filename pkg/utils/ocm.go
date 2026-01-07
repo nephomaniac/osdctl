@@ -253,39 +253,6 @@ func loadOCMConfig() (*ocmConfig.Config, error) {
 	return cfg, nil
 }
 
-/*
-func getOcmConfiguration(ocmConfigLoader func() (*ocmConfig.Config, error)) (*ocmConfig.Config, error) {
-	tokenEnv := os.Getenv("OCM_TOKEN")
-	urlEnv := os.Getenv("OCM_URL")
-	refreshTokenEnv := os.Getenv("OCM_REFRESH_TOKEN") // Unlikely to be set, but check anyway
-
-	config := &ocmConfig.Config{}
-
-	// If missing required data, load from the config file.
-	// We don't want to always load this, because the user might only use environment variables.
-	if tokenEnv == "" || refreshTokenEnv == "" || urlEnv == "" {
-		var fileConfigLoadError error
-		config, fileConfigLoadError = ocmConfigLoader()
-		if fileConfigLoadError != nil {
-			return config, fmt.Errorf("could not load OCM configuration file")
-		}
-	}
-
-	// Overwrite with set environment variables, to allow users to overwrite
-	// their configuration file's variables
-	if tokenEnv != "" {
-		config.AccessToken = tokenEnv
-	}
-	if urlEnv != "" {
-		config.URL = urlEnv
-	}
-	if refreshTokenEnv != "" {
-		config.RefreshToken = refreshTokenEnv
-	}
-
-	return config, nil
-}*/
-
 // Creates a connection to OCM
 func CreateConnection() (*sdk.Connection, error) {
 	urlEnv := os.Getenv("OCM_URL")
@@ -508,9 +475,9 @@ func GetHiveCluster(clusterId string) (*cmv1.Cluster, error) {
 	return resp.Items().Get(0), nil
 }
 
-func GetHiveBPForCluster(clusterID string, options client.Options, elevationReason string, hiveOCMURL string) (client.Client, error) {
-	var hiveOCMConn *sdk.Connection = nil
-	var err error = nil
+func GetHiveBPClientForCluster(clusterID string, options client.Options, elevationReason string, hiveOCMURL string) (client.Client, error) {
+	var hiveOCMConn *sdk.Connection
+	var err error
 	if len(clusterID) <= 0 {
 		return nil, fmt.Errorf("GetHiveBPClientForCluster provided empty target cluster ID")
 	}
@@ -522,9 +489,10 @@ func GetHiveBPForCluster(clusterID string, options client.Options, elevationReas
 		if err != nil {
 			return nil, fmt.Errorf("unable to create hive OCM connection with URL:'%s'. Err: %w", hiveOCMURL, err)
 		}
+		defer hiveOCMConn.Close()
 		hiveCluster, err := GetHiveClusterWithConn(clusterID, nil, hiveOCMConn)
 		if err != nil {
-			return nil, fmt.Errorf("Failed to fetch hive cluster for cluster:'%s', ocmURL:'%s', Err:'%v'", clusterID, hiveOCMURL, err)
+			return nil, fmt.Errorf("failed to fetch hive cluster for cluster:'%s', ocmURL:'%s', Err:'%v'", clusterID, hiveOCMURL, err)
 		}
 		if len(elevationReason) > 0 {
 			return k8s.NewAsBackplaneClusterAdminWithConn(hiveCluster.ID(), options, hiveOCMConn, elevationReason)
@@ -533,7 +501,7 @@ func GetHiveBPForCluster(clusterID string, options client.Options, elevationReas
 	} else {
 		hiveCluster, err := GetHiveCluster(clusterID)
 		if err != nil {
-			return nil, fmt.Errorf("Failed to fetch hive cluster for cluster:'%s', err:'%v'", clusterID, err)
+			return nil, fmt.Errorf("failed to fetch hive cluster for cluster:'%s', err:'%v'", clusterID, err)
 		}
 		if len(elevationReason) > 0 {
 			return k8s.NewAsBackplaneClusterAdmin(hiveCluster.ID(), options, elevationReason)
@@ -548,12 +516,13 @@ func GetHiveBPForCluster(clusterID string, options client.Options, elevationReas
 // can be provided for accessing each. If nil is provided a temporary connection using
 // the default OCM env vars will be made.
 func GetHiveClusterWithConn(clusterId string, clusterOCM *sdk.Connection, hiveOCM *sdk.Connection) (*cmv1.Cluster, error) {
-	var err error = nil
+	var err error
 	if clusterOCM == nil {
 		clusterOCM, err = CreateConnection()
 		if err != nil {
 			return nil, err
 		}
+		// If provided by caller do not close, only close if connection created here.
 		defer clusterOCM.Close()
 	}
 	if hiveOCM == nil {

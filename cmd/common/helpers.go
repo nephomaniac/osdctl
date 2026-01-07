@@ -103,5 +103,5 @@ func GetKubeConfigAndClientWithConn(clusterID string, ocm *ocmsdk.Connection, el
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	return kubeCli, kubeconfig, clientset, err
+	return kubeCli, kubeconfig, clientset, nil
 }

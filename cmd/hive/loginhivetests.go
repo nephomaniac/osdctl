@@ -113,21 +113,19 @@ func dumpClusterOperators(kubeClient client.Client) error {
 	return nil
 }
 
-func getClusterDeployment(hiveKubeClient client.Client, clusterID string) (cd hivev1.ClusterDeployment, err error) {
+func getClusterDeployment(hiveKubeClient client.Client, clusterID string) (cd *hivev1.ClusterDeployment, err error) {
 	var cds hivev1.ClusterDeploymentList
 	if err := hiveKubeClient.List(context.TODO(), &cds, &client.ListOptions{}); err != nil {
 		fmt.Printf("err fetching cluster deployments, err:'%v'", err)
-		return cd, err
+		return nil, err
 	}
-	var clusterDeployment hivev1.ClusterDeployment
-	for _, cd := range cds.Items {
-		if strings.Contains(cd.Namespace, clusterID) {
-			return cd, nil
+	for _, cdeploy := range cds.Items {
+		if strings.Contains(cdeploy.Namespace, clusterID) {
+			fmt.Printf("Got Hive ClusterDeployment for target cluster:'%s'\n", cdeploy.Name)
+			return &cdeploy, nil
 		}
 	}
-	fmt.Printf("Got Hive ClusterDeployment for target cluster:'%s'\n", clusterDeployment.Name)
-
-	return cd, fmt.Errorf("clusterDeployment for cluster:'%s' not found", clusterID)
+	return nil, fmt.Errorf("clusterDeployment for cluster:'%s' not found", clusterID)
 }
 
 // setupOCMConnection creates an OCM client and fetches the target cluster
@@ -401,7 +399,7 @@ func testGetKubeConfigAndClientWithConnAdmin(clusterID string, ocmClient *sdk.Co
 // testGetHiveBPWithoutElevation tests GetHiveBPForCluster() without elevation
 func testGetHiveBPWithoutElevation(clusterID, hiveOcmURL string) error {
 	fmt.Printf("Testing GetHiveBPForCluster() hive backplane connection w/o elevation\n")
-	hiveBP, err := utils.GetHiveBPForCluster(clusterID, client.Options{}, "", hiveOcmURL)
+	hiveBP, err := utils.GetHiveBPClientForCluster(clusterID, client.Options{}, "", hiveOcmURL)
 	if err != nil {
 		return err
 	}
@@ -418,7 +416,7 @@ func testGetHiveBPWithoutElevation(clusterID, hiveOcmURL string) error {
 // testGetHiveBPWithElevation tests GetHiveBPForCluster() with elevation
 func testGetHiveBPWithElevation(clusterID, reason, hiveOcmURL string) error {
 	fmt.Printf("Testing GetHiveBPForCluster() hive backplane connection w/o elevation\n")
-	hiveBP, err := utils.GetHiveBPForCluster(clusterID, client.Options{}, reason, hiveOcmURL)
+	hiveBP, err := utils.GetHiveBPClientForCluster(clusterID, client.Options{}, reason, hiveOcmURL)
 	if err != nil {
 		return err
 	}
