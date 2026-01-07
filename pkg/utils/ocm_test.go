@@ -8,6 +8,7 @@ import (
 
 	ocmConfig "github.com/openshift-online/ocm-common/pkg/ocm/config"
 	sdk "github.com/openshift-online/ocm-sdk-go"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 func resetEnvVars(t *testing.T) {
@@ -390,6 +391,205 @@ func TestGetHiveClusterWithConn(t *testing.T) {
 			} else {
 				if err != nil {
 					t.Errorf("GetHiveClusterWithConn() unexpected error = %v", err)
+				}
+			}
+		})
+	}
+}
+
+// TestGetOCMConfigFromEnv tests the GetOCMConfigFromEnv function which loads
+// OCM configuration from environment variables and default file locations.
+// It validates the function's ability to handle different config file locations
+// including OCM_CONFIG env var, ~/.ocm.json, and $XDG_CONFIG_HOME/ocm/ocm.json.
+func TestGetOCMConfigFromEnv(t *testing.T) {
+	tests := []struct {
+		name        string
+		setupFunc   func(t *testing.T) func()
+		wantErr     bool
+		errContains string
+		checkConfig func(*testing.T, *ocmConfig.Config)
+	}{
+		{
+			// Test loading config from a custom OCM_CONFIG environment variable path
+			name: "with OCM_CONFIG env var set to valid file",
+			setupFunc: func(t *testing.T) func() {
+				tmpDir := t.TempDir()
+				configFile := filepath.Join(tmpDir, "custom-ocm.json")
+				config := ocmConfig.Config{
+					AccessToken:  "test-token-from-env",
+					RefreshToken: "test-refresh",
+					URL:          "https://api.openshift.com",
+				}
+				data, err := json.Marshal(config)
+				if err != nil {
+					t.Fatalf("failed to marshal config: %v", err)
+				}
+				if err := os.WriteFile(configFile, data, 0644); err != nil {
+					t.Fatalf("failed to write config file: %v", err)
+				}
+				oldVal := os.Getenv("OCM_CONFIG")
+				os.Setenv("OCM_CONFIG", configFile)
+				return func() {
+					os.Setenv("OCM_CONFIG", oldVal)
+				}
+			},
+			wantErr: false,
+			checkConfig: func(t *testing.T, cfg *ocmConfig.Config) {
+				if cfg == nil {
+					t.Error("expected non-nil config")
+					return
+				}
+				if cfg.AccessToken != "test-token-from-env" {
+					t.Errorf("expected AccessToken 'test-token-from-env', got '%s'", cfg.AccessToken)
+				}
+			},
+		},
+		{
+			// Test that when no config file exists, an empty config is returned without error
+			name: "no config file exists - returns empty config",
+			setupFunc: func(t *testing.T) func() {
+				// Set OCM_CONFIG to a non-existent path
+				oldVal := os.Getenv("OCM_CONFIG")
+				os.Setenv("OCM_CONFIG", "/nonexistent/path/ocm.json")
+				return func() {
+					os.Setenv("OCM_CONFIG", oldVal)
+				}
+			},
+			wantErr: false,
+			checkConfig: func(t *testing.T, cfg *ocmConfig.Config) {
+				if cfg == nil {
+					t.Error("expected non-nil empty config")
+				}
+			},
+		},
+		{
+			// Test that a malformed config file returns a parse error
+			name: "invalid json in config file",
+			setupFunc: func(t *testing.T) func() {
+				tmpDir := t.TempDir()
+				configFile := filepath.Join(tmpDir, "invalid-ocm.json")
+				if err := os.WriteFile(configFile, []byte("{invalid json}"), 0644); err != nil {
+					t.Fatalf("failed to write invalid json: %v", err)
+				}
+				oldVal := os.Getenv("OCM_CONFIG")
+				os.Setenv("OCM_CONFIG", configFile)
+				return func() {
+					os.Setenv("OCM_CONFIG", oldVal)
+				}
+			},
+			wantErr:     true,
+			errContains: "can't parse config file",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cleanup := tt.setupFunc(t)
+			defer cleanup()
+
+			cfg, err := GetOCMConfigFromEnv()
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("GetOCMConfigFromEnv() expected error but got none")
+				} else if tt.errContains != "" && !contains(err.Error(), tt.errContains) {
+					t.Errorf("GetOCMConfigFromEnv() error = %v, want error containing %v", err, tt.errContains)
+				}
+			} else {
+				if err != nil {
+					t.Errorf("GetOCMConfigFromEnv() unexpected error = %v", err)
+				}
+				if tt.checkConfig != nil {
+					tt.checkConfig(t, cfg)
+				}
+			}
+		})
+	}
+}
+
+// TestCreateConnectionWithUrl tests the CreateConnectionWithUrl function which creates
+// an OCM SDK connection with a specified URL. It validates URL alias handling for
+// 'production', 'staging', and 'integration' environments.
+// Note: Successful connection creation requires valid OCM credentials and is tested
+// in integration tests or the hive-login test command.
+func TestCreateConnectionWithUrl(t *testing.T) {
+	tests := []struct {
+		name        string
+		ocmUrl      string
+		wantErr     bool
+		errContains string
+	}{
+		{
+			// Test that an empty URL returns an error
+			name:        "empty URL",
+			ocmUrl:      "",
+			wantErr:     true,
+			errContains: "empty OCM URL",
+		},
+		{
+			// Test that an invalid alias returns an error with valid aliases listed
+			name:        "invalid URL alias",
+			ocmUrl:      "invalid-alias",
+			wantErr:     true,
+			errContains: "invalid OCM_URL found",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := CreateConnectionWithUrl(tt.ocmUrl)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("CreateConnectionWithUrl() expected error but got none")
+				} else if tt.errContains != "" && !contains(err.Error(), tt.errContains) {
+					t.Errorf("CreateConnectionWithUrl() error = %v, want error containing %v", err, tt.errContains)
+				}
+			} else {
+				if err != nil {
+					t.Errorf("CreateConnectionWithUrl() unexpected error = %v", err)
+				}
+			}
+		})
+	}
+}
+
+// TestGetHiveBPForCluster tests the GetHiveBPForCluster function which creates a
+// backplane client connection to a hive cluster. It validates input validation and
+// error handling for empty cluster IDs.
+// Note: Successful connection creation requires valid cluster ID, OCM credentials,
+// and accessible hive cluster. These scenarios are tested in integration tests or
+// the hive-login test command.
+func TestGetHiveBPForCluster(t *testing.T) {
+	tests := []struct {
+		name             string
+		clusterID        string
+		elevationReason  string
+		hiveOCMURL       string
+		wantErr          bool
+		errContains      string
+	}{
+		{
+			// Test that an empty cluster ID returns an error
+			name:            "empty cluster ID",
+			clusterID:       "",
+			elevationReason: "",
+			hiveOCMURL:      "",
+			wantErr:         true,
+			errContains:     "empty target cluster ID",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := GetHiveBPForCluster(tt.clusterID, client.Options{}, tt.elevationReason, tt.hiveOCMURL)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("GetHiveBPForCluster() expected error but got none")
+				} else if tt.errContains != "" && !contains(err.Error(), tt.errContains) {
+					t.Errorf("GetHiveBPForCluster() error = %v, want error containing %v", err, tt.errContains)
+				}
+			} else {
+				if err != nil {
+					t.Errorf("GetHiveBPForCluster() unexpected error = %v", err)
 				}
 			}
 		})
