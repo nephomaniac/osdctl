@@ -28,19 +28,19 @@ type testHiveLoginOptions struct {
 	clusterID         string
 	output            string
 	verbose           bool
-	awsProfile        string
 	hiveOcmConfigPath string
 	hiveOcmURL        string
 	reason            string
 }
 
 const longDescription = `
-This test utility attempts to exercise and validate functions related to
+This test utility attempts to exercise and validate OSDCTL's functions related to
 OCM and backplane client connections. 
 	
-This test utiltiy can be run against an	OSD/Rosa Classic target cluster, and will attempt 
-OCM and kube client connections and requests for both the target cluster and the 
-Hive cluster servicing the target cluster. 
+This test utiltiy can be run against an	OSD/Rosa Classic target cluster. This utility
+will attempt to discover the Hive cluster, and create both
+OCM and kube client connections, and perform basic requests for each to connection in 
+order to validate functionality of the related OSDCTL utility functions.  
 	
 This test utility allows for the target cluster to exist in a separate OCM 
 environment (ie integration, staging) from the hive cluster (ie production).
@@ -49,7 +49,8 @@ The default OCM environment vars should be set for the target cluster.
 If the target cluster exists outside of the OCM 'production' environment, the user 
 has the option to provide the production OCM config (with valid token set), 
 or provide the production OCM API url as a command arguement, or set the value in the osdctl 
-config yaml file (ie: "hive_ocm_url: https://api.openshift.com" ).
+config yaml file (ie: "hive_ocm_url: https://api.openshift.com" or "hive_ocm_url: production" ).
+For testing purposes comment out 'hive_ocm_url' from osdctl's config if testing an empty value. 
 `
 
 // Defines command to run through series of tests to validate existing and new and legacy
@@ -57,8 +58,8 @@ config yaml file (ie: "hive_ocm_url: https://api.openshift.com" ).
 func newCmdTestHiveLogin() *cobra.Command {
 	ops := newtestHiveLoginOptions()
 	testHiveLoginCmd := &cobra.Command{
-		Use:               "hive-login",
-		Short:             "Test Login into both Target Cluster and supporting Hive Cluster.",
+		Use:               "login-tests",
+		Short:             "Test utility to exercise OSDCTL client connections for both Target Cluster and it's Hive Cluster.",
 		Long:              longDescription,
 		Args:              cobra.NoArgs,
 		DisableAutoGenTag: true,
@@ -69,9 +70,8 @@ func newCmdTestHiveLogin() *cobra.Command {
 
 	testHiveLoginCmd.Flags().BoolVarP(&ops.verbose, "verbose", "", false, "Verbose output")
 	testHiveLoginCmd.Flags().StringVarP(&ops.clusterID, "cluster-id", "C", "", "Cluster ID")
-	testHiveLoginCmd.Flags().StringVarP(&ops.awsProfile, "profile", "p", "", "AWS Profile")
 	testHiveLoginCmd.Flags().StringVar(&ops.hiveOcmConfigPath, "hive-ocm-config", "", "OCM config for hive if different than Cluster")
-	testHiveLoginCmd.Flags().StringVar(&ops.hiveOcmURL, "hive-ocm-url", "", "OCM URL for hive if different than Cluster")
+	testHiveLoginCmd.Flags().StringVar(&ops.hiveOcmURL, "hive-ocm-url", "", "OCM URL for hive, this will fallback to reading from the osdctl config value: 'hive_ocm_url' if left empty")
 
 	testHiveLoginCmd.MarkFlagRequired("cluster-id")
 	return testHiveLoginCmd
@@ -79,11 +79,6 @@ func newCmdTestHiveLogin() *cobra.Command {
 
 func newtestHiveLoginOptions() *testHiveLoginOptions {
 	return &testHiveLoginOptions{}
-}
-
-func (o *testHiveLoginOptions) complete(cmd *cobra.Command, _ []string) error {
-
-	return nil
 }
 
 func printDiv() {
@@ -153,6 +148,7 @@ func (o *testHiveLoginOptions) run() error {
 	var hiveOCMCfg *ocmConfig.Config = nil
 	var hiveCluster *v1.Cluster = nil
 
+	printDiv()
 	fmt.Printf("Building ocm client using legacy functions and env vars...\n")
 	ocmClient, err := utils.CreateConnection()
 	if err != nil {
