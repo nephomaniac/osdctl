@@ -14,6 +14,9 @@ import (
 	sdk "github.com/openshift-online/ocm-sdk-go"
 	amsv1 "github.com/openshift-online/ocm-sdk-go/accountsmgmt/v1"
 	cmv1 "github.com/openshift-online/ocm-sdk-go/clustersmgmt/v1"
+	"github.com/openshift/osdctl/pkg/k8s"
+	"github.com/spf13/viper"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	ocmConfig "github.com/openshift-online/ocm-common/pkg/ocm/config"
 	ocmConnBuilder "github.com/openshift-online/ocm-common/pkg/ocm/connection-builder"
@@ -314,6 +317,34 @@ func CreateConnection() (*sdk.Connection, error) {
 	return connBuilder.Build()
 }
 
+// Creates a connection to OCM
+func CreateConnectionWithUrl(OcmUrl string) (*sdk.Connection, error) {
+	var ocmApiUrl string = OcmUrl
+	if len(OcmUrl) <= 0 {
+		return nil, fmt.Errorf("CreateConnectionWithUrl provided empty OCM URL")
+	}
+	// First we need to validate URL in the case where it may be an alias
+	ocmApiUrl, ok := urlAliases[OcmUrl]
+	if !ok {
+		return nil, fmt.Errorf("invalid OCM_URL found: %s\nValid URL aliases are: 'production', 'staging', 'integration'", OcmUrl)
+	}
+	config, err := ocmConfig.Load()
+	if err != nil {
+		return nil, fmt.Errorf("unable to load OCM config. %w", err)
+	}
+
+	agentString := fmt.Sprintf("osdctl-%s", Version)
+
+	connBuilder := ocmConnBuilder.NewConnection().Config(config).AsAgent(agentString)
+
+	if connBuilder == nil {
+		return nil, fmt.Errorf("CreateConnectionWithUrl, ocm connection builder returned nil builder")
+	}
+	connBuilder.WithApiUrl(ocmApiUrl)
+
+	return connBuilder.Build()
+}
+
 func GetSupportRoleArnForCluster(ocmClient *sdk.Connection, clusterID string) (string, error) {
 
 	clusterResponse, err := ocmClient.ClustersMgmt().V1().Clusters().Cluster(clusterID).Get().Send()
@@ -475,6 +506,40 @@ func GetHiveCluster(clusterId string) (*cmv1.Cluster, error) {
 	}
 
 	return resp.Items().Get(0), nil
+}
+
+func GetHiveBPForCluster(clusterID string, options client.Options, elevationReason string, hiveOCMURL string) (client.Client, error) {
+	var hiveOCMConn *sdk.Connection = nil
+	var err error = nil
+	if len(clusterID) <= 0 {
+		return nil, fmt.Errorf("GetHiveBPClientForCluster provided empty target cluster ID")
+	}
+	if len(hiveOCMURL) <= 0 {
+		hiveOCMURL = viper.GetString("hive_ocm_url")
+	}
+	if len(hiveOCMURL) > 0 {
+		hiveOCMConn, err = CreateConnectionWithUrl(hiveOCMURL)
+		if err != nil {
+			return nil, fmt.Errorf("unable to create hive OCM connection with URL:'%s'. Err: %w", hiveOCMURL, err)
+		}
+		hiveCluster, err := GetHiveClusterWithConn(clusterID, nil, hiveOCMConn)
+		if err != nil {
+			return nil, fmt.Errorf("Failed to fetch hive cluster for cluster:'%s', ocmURL:'%s', Err:'%v'", clusterID, hiveOCMURL, err)
+		}
+		if len(elevationReason) > 0 {
+			return k8s.NewAsBackplaneClusterAdminWithConn(hiveCluster.ID(), options, hiveOCMConn, elevationReason)
+		}
+		return k8s.NewWithConn(hiveCluster.ID(), options, hiveOCMConn)
+	} else {
+		hiveCluster, err := GetHiveCluster(clusterID)
+		if err != nil {
+			return nil, fmt.Errorf("Failed to fetch hive cluster for cluster:'%s', err:'%v'", clusterID, err)
+		}
+		if len(elevationReason) > 0 {
+			return k8s.NewAsBackplaneClusterAdmin(hiveCluster.ID(), options, elevationReason)
+		}
+		return k8s.New(hiveCluster.ID(), options)
+	}
 }
 
 // Fetch Hive Cluster with provided OCM connections.

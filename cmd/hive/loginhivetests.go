@@ -328,6 +328,37 @@ func (o *testHiveLoginOptions) run() error {
 	}
 	fmt.Println("bpadmin Create and test Kube Client, Clientset with GetKubeConfigAndClientWithConn() - PASS")
 	printDiv()
+	fmt.Printf("Testing GetHiveBPForCluster() hive backplane connection w/o elevation\n")
+	hiveBP, err := utils.GetHiveBPForCluster(clusterID, client.Options{}, "", o.hiveOcmURL)
+	if err != nil {
+		return err
+	}
+	// Test an API call to this hive cluster, dump the cluster operators...
+	err = dumpClusterOperators(hiveBP)
+	if err != nil {
+		return err
+	}
+	fmt.Println("Create and test GetHiveBPForCluster() without elevation reason - PASS")
+	printDiv()
+
+	fmt.Printf("Testing GetHiveBPForCluster() hive backplane connection w/o elevation\n")
+	hiveBP, err = utils.GetHiveBPForCluster(clusterID, client.Options{}, "Testing hive client backplane connections", o.hiveOcmURL)
+	if err != nil {
+		return err
+	}
+	// Test an API call to this hive cluster, dump the cluster operators...
+	err = dumpClusterOperators(hiveBP)
+	if err != nil {
+		return err
+	}
+	// Test an elevated API call to this cluster, dump the cluster operators...
+	clusterDep, err = getClusterDeployment(hiveBP, clusterID)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Fetched ClusterDeployment:'%s/%s' for cluster:'%s' from HIVE using elevated client\n", clusterDep.Namespace, clusterDep.Name, clusterID)
+	fmt.Println("Create and test GetHiveBPForCluster() with elevation reason - PASS")
+	printDiv()
 	fmt.Println("All tests Passed")
 	return nil
 }
