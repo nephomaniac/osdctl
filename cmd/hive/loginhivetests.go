@@ -130,8 +130,316 @@ func getClusterDeployment(hiveKubeClient client.Client, clusterID string) (cd hi
 	return cd, fmt.Errorf("clusterDeployment for cluster:'%s' not found", clusterID)
 }
 
-func (o *testHiveLoginOptions) run() error {
+// setupOCMConnection creates an OCM client and fetches the target cluster
+func setupOCMConnection(clusterID string) (*sdk.Connection, *v1.Cluster, string, error) {
+	printDiv()
+	fmt.Printf("Building ocm client using legacy functions and env vars...\n")
+	ocmClient, err := utils.CreateConnection()
+	if err != nil {
+		return nil, nil, "", err
+	}
 
+	cluster, err := utils.GetClusterAnyStatus(ocmClient, clusterID)
+	if err != nil {
+		fmt.Printf("Failed to fetch cluster '%s' from OCM, err:'%v'", clusterID, err)
+		return nil, nil, "", err
+	}
+
+	actualClusterID := cluster.ID()
+	if clusterID != actualClusterID {
+		fmt.Printf("Using internal ID:'%s' for provided cluster:'%s'\n", actualClusterID, clusterID)
+	}
+
+	fmt.Printf("Fetched cluster from OCM:'%s'\n", actualClusterID)
+	printDiv()
+
+	return ocmClient, cluster, actualClusterID, nil
+}
+
+// setupHiveOCMConfig builds the Hive OCM configuration from provided options
+func setupHiveOCMConfig(hiveOcmConfigPath, hiveOcmURL string) (*ocmConfig.Config, error) {
+	var hiveOCMCfg *ocmConfig.Config
+	var err error
+
+	// Test building OCM config from a provided file path
+	if len(hiveOcmConfigPath) > 0 {
+		fmt.Printf("Attempting to build OCM config from provided file path...\n")
+		hiveOCMCfg, err = utils.GetOcmConfigFromFilePath(hiveOcmConfigPath)
+		if err != nil {
+			fmt.Printf("Failed to build Hive OCM config from file path:'%s'\n", hiveOcmConfigPath)
+			return nil, err
+		}
+	}
+
+	// Test replacing just the OCM URL for an already built config
+	if len(hiveOcmURL) > 0 {
+		if hiveOCMCfg == nil {
+			fmt.Printf("Attempting to build OCM config...\n")
+			hiveOCMCfg, err = utils.GetOCMConfigFromEnv()
+			if err != nil {
+				fmt.Printf("Failed to build OCM config from legacy function\n")
+				return nil, err
+			}
+		}
+		hiveOCMCfg.URL = hiveOcmURL
+	}
+
+	return hiveOCMCfg, nil
+}
+
+// setupHiveOCMConnection creates an OCM connection for Hive using the provided config
+func setupHiveOCMConnection(hiveOCMCfg *ocmConfig.Config, hiveOcmConfigPath string) (*sdk.Connection, error) {
+	if hiveOCMCfg == nil {
+		return nil, nil
+	}
+
+	hiveBuilder, err := utils.GetOCMSdkConnBuilderFromConfig(hiveOCMCfg)
+	if err != nil {
+		fmt.Printf("Failed to create sdk connection builder from hive ocm cfg, err:'%s'\n", err)
+		return nil, err
+	}
+
+	hiveOCM, err := hiveBuilder.Build()
+	if err != nil {
+		fmt.Printf("Error connecting to OCM env using config at: '%s'\nErr:%v", hiveOcmConfigPath, err)
+		return nil, err
+	}
+
+	fmt.Printf("Built OCM config and connection from provided config inputs\n")
+	printDiv()
+
+	return hiveOCM, nil
+}
+
+// setupHiveCluster fetches the Hive cluster for the target cluster
+func setupHiveCluster(clusterID string, ocmClient, hiveOCM *sdk.Connection) (*v1.Cluster, error) {
+	// No OCM related config provided, test the legacy path
+	if hiveOCM == nil {
+		fmt.Println("---- No hive config provided. Using same OCM connections for target cluster and hive ----")
+		hiveOCM = ocmClient
+		_, err := utils.GetHiveCluster(clusterID)
+		if err != nil {
+			fmt.Printf("Failed to fetch hive cluster from OCM with legacy function, err:'%v'", err)
+			return nil, err
+		}
+	}
+
+	printDiv()
+	hiveCluster, err := utils.GetHiveClusterWithConn(clusterID, ocmClient, hiveOCM)
+	if err != nil {
+		fmt.Printf("Failed to fetch hive cluster with provided OCM conneciton, err:'%v'", err)
+		return nil, err
+	}
+
+	fmt.Printf("Got Hive Cluster from OCM:'%s'\n", hiveCluster.ID())
+	printDiv()
+
+	return hiveCluster, nil
+}
+
+// testK8sNew tests creating a Kube client using k8s.New()
+func testK8sNew(clusterID string, cluster *v1.Cluster) error {
+	fmt.Println("Attempting to create and test Kube Client with k8s.New()...")
+	kubeClient, err := k8s.New(clusterID, client.Options{})
+	if err != nil {
+		return fmt.Errorf("failed to login to cluster:'%s', err: %w", clusterID, err)
+	}
+	fmt.Printf("Created client connection to target cluster:'%s', '%s'\n", cluster.ID(), cluster.Name())
+
+	if err := dumpClusterOperators(kubeClient); err != nil {
+		return err
+	}
+
+	fmt.Println("Create and test Kube Client with k8s.New() - PASS")
+	printDiv()
+	return nil
+}
+
+// testK8sNewWithConn tests creating a Kube client using k8s.NewWithConn()
+func testK8sNewWithConn(hiveCluster *v1.Cluster, hiveOCM *sdk.Connection) error {
+	fmt.Println("Attempting to create and test Kube Client with k8s.NewWithConn()...")
+	hiveClient, err := k8s.NewWithConn(hiveCluster.ID(), client.Options{}, hiveOCM)
+	if err != nil {
+		return fmt.Errorf("failed to login to hive cluster:'%s', err %w", hiveCluster.ID(), err)
+	}
+	fmt.Printf("Created client connection to HIVE cluster:'%s', '%s'\n", hiveCluster.ID(), hiveCluster.Name())
+
+	if err := dumpClusterOperators(hiveClient); err != nil {
+		return err
+	}
+
+	fmt.Println("Create and test Kube Client with k8s.NewWithConn() - PASS")
+	printDiv()
+	return nil
+}
+
+// testK8sNewAsBackplaneClusterAdmin tests creating an elevated Kube client using k8s.NewAsBackplaneClusterAdminWithConn()
+func testK8sNewAsBackplaneClusterAdmin(hiveCluster *v1.Cluster, hiveOCM *sdk.Connection, clusterID, reason string) error {
+	fmt.Println("Attempting to create and test Kube Client with k8s.NewAsBackplaneClusterAdminWithConn()...")
+	hiveAdminClient, err := k8s.NewAsBackplaneClusterAdminWithConn(hiveCluster.ID(), client.Options{}, hiveOCM, reason)
+	if err != nil {
+		return fmt.Errorf("failed to login to hive cluster:'%s', err %w", hiveCluster.ID(), err)
+	}
+	fmt.Printf("Created 'ClusterAdmin' client connection to HIVE cluster:'%s', '%s'\n", hiveCluster.ID(), hiveCluster.Name())
+
+	clusterDep, err := getClusterDeployment(hiveAdminClient, clusterID)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Fetched ClusterDeployment:'%s/%s' for cluster:'%s' from HIVE using elevated client\n", clusterDep.Namespace, clusterDep.Name, clusterID)
+	fmt.Println("Create and test Kube Client withk8s.NewAsBackplaneClusterAdminWithConn() - PASS")
+	printDiv()
+	return nil
+}
+
+// testGetKubeConfigAndClient tests GetKubeConfigAndClient() without admin elevation
+func testGetKubeConfigAndClient(clusterID string) error {
+	fmt.Printf("Testing non-backplane-admin client, clientSet GetKubeConfigAndClient() for cluster:'%s'\n", clusterID)
+	kubeCli, _, kubeClientSet, err := common.GetKubeConfigAndClient(clusterID)
+	if err != nil {
+		return err
+	}
+
+	if err := dumpClusterOperators(kubeCli); err != nil {
+		return err
+	}
+
+	nsList, err := kubeClientSet.CoreV1().Namespaces().List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		fmt.Printf("ClientSet list namespaces failed, err:'%v'\n", err)
+		return err
+	}
+
+	fmt.Printf("Got '%d' namespaces\n", len(nsList.Items))
+	fmt.Println("non-bpadmin Create and test Kube Client, Clientset with GetKubeConfigAndClient() - PASS")
+	printDiv()
+	return nil
+}
+
+// testGetKubeConfigAndClientWithConn tests GetKubeConfigAndClientWithConn() without admin elevation
+func testGetKubeConfigAndClientWithConn(clusterID string, ocmClient *sdk.Connection) error {
+	fmt.Printf("Testing non-backplane-admin client, clientset GetKubeConfigAndClientWithConn for cluster:'%s'\n", clusterID)
+	kubeCli, _, kubeClientSet, err := common.GetKubeConfigAndClientWithConn(clusterID, ocmClient)
+	if err != nil {
+		return err
+	}
+
+	if err := dumpClusterOperators(kubeCli); err != nil {
+		return err
+	}
+
+	nsList, err := kubeClientSet.CoreV1().Namespaces().List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		fmt.Printf("ClientSet list namespaces failed, err:'%v'\n", err)
+		return err
+	}
+
+	fmt.Printf("Got '%d' namespaces\n", len(nsList.Items))
+	fmt.Println("non-bpadmin Create and test Kube Client, Clientset with GetKubeConfigAndClientWithConn() - PASS")
+	printDiv()
+	return nil
+}
+
+// testGetKubeConfigAndClientAdmin tests GetKubeConfigAndClient() with admin elevation
+func testGetKubeConfigAndClientAdmin(clusterID, reason string) error {
+	fmt.Printf("Testing backplane-admin client, clientset GetKubeConfigAndClient() for cluster:'%s'\n", clusterID)
+	kubeCli, _, kubeClientSet, err := common.GetKubeConfigAndClient(clusterID, reason)
+	if err != nil {
+		return err
+	}
+
+	if err := dumpClusterOperators(kubeCli); err != nil {
+		return err
+	}
+
+	openshiftMonitoringNamespace := "openshift-monitoring"
+	podList, err := kubeClientSet.CoreV1().Pods(openshiftMonitoringNamespace).List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		fmt.Printf("ClientSet list 'openshift-monitoring' pods failed, err:'%v'\n", err)
+		return err
+	}
+
+	fmt.Printf("Got %d pods in namespace:'%s' :\n", len(podList.Items), openshiftMonitoringNamespace)
+	for i, pod := range podList.Items {
+		fmt.Printf("Got pod (%d/%d): '%s/%s' \n", i, len(podList.Items), pod.Namespace, pod.Name)
+	}
+
+	fmt.Println("bpadmin Create and test Kube Client, Clientset with GetKubeConfigAndClient() - PASS")
+	printDiv()
+	return nil
+}
+
+// testGetKubeConfigAndClientWithConnAdmin tests GetKubeConfigAndClientWithConn() with admin elevation
+func testGetKubeConfigAndClientWithConnAdmin(clusterID string, ocmClient *sdk.Connection, reason string) error {
+	fmt.Printf("Testing backplane-admin GetKubeConfigAndClientWithConn() for cluster:'%s'\n", clusterID)
+	kubeCli, _, kubeClientSet, err := common.GetKubeConfigAndClientWithConn(clusterID, ocmClient, reason)
+	if err != nil {
+		return err
+	}
+
+	if err := dumpClusterOperators(kubeCli); err != nil {
+		return err
+	}
+
+	podList, err := kubeClientSet.CoreV1().Pods("openshift-monitoring").List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		fmt.Printf("ClientSet list 'openshift-monitoring' pods failed, err:'%v'\n", err)
+		return err
+	}
+
+	fmt.Printf("Got %d pods\n", len(podList.Items))
+	for i, pod := range podList.Items {
+		fmt.Printf("Got pod (%d/%d): '%s/%s' \n", i, len(podList.Items), pod.Namespace, pod.Name)
+	}
+
+	fmt.Println("bpadmin Create and test Kube Client, Clientset with GetKubeConfigAndClientWithConn() - PASS")
+	printDiv()
+	return nil
+}
+
+// testGetHiveBPWithoutElevation tests GetHiveBPForCluster() without elevation
+func testGetHiveBPWithoutElevation(clusterID, hiveOcmURL string) error {
+	fmt.Printf("Testing GetHiveBPForCluster() hive backplane connection w/o elevation\n")
+	hiveBP, err := utils.GetHiveBPForCluster(clusterID, client.Options{}, "", hiveOcmURL)
+	if err != nil {
+		return err
+	}
+
+	if err := dumpClusterOperators(hiveBP); err != nil {
+		return err
+	}
+
+	fmt.Println("Create and test GetHiveBPForCluster() without elevation reason - PASS")
+	printDiv()
+	return nil
+}
+
+// testGetHiveBPWithElevation tests GetHiveBPForCluster() with elevation
+func testGetHiveBPWithElevation(clusterID, reason, hiveOcmURL string) error {
+	fmt.Printf("Testing GetHiveBPForCluster() hive backplane connection w/o elevation\n")
+	hiveBP, err := utils.GetHiveBPForCluster(clusterID, client.Options{}, reason, hiveOcmURL)
+	if err != nil {
+		return err
+	}
+
+	if err := dumpClusterOperators(hiveBP); err != nil {
+		return err
+	}
+
+	clusterDep, err := getClusterDeployment(hiveBP, clusterID)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Fetched ClusterDeployment:'%s/%s' for cluster:'%s' from HIVE using elevated client\n", clusterDep.Namespace, clusterDep.Name, clusterID)
+	fmt.Println("Create and test GetHiveBPForCluster() with elevation reason - PASS")
+	printDiv()
+	return nil
+}
+
+func (o *testHiveLoginOptions) run() error {
+	// Initialize Hive OCM URL from args or config
 	if len(o.hiveOcmURL) > 0 {
 		fmt.Printf("Using Hive OCM URL set in args:'%s'\n", o.hiveOcmURL)
 	} else {
@@ -144,236 +452,70 @@ func (o *testHiveLoginOptions) run() error {
 	}
 
 	o.reason = "Testing osdctl clients with cluster admin"
-	var hiveOCM *sdk.Connection = nil
-	var hiveOCMCfg *ocmConfig.Config = nil
-	var hiveCluster *v1.Cluster = nil
 
-	printDiv()
-	fmt.Printf("Building ocm client using legacy functions and env vars...\n")
-	ocmClient, err := utils.CreateConnection()
+	// Setup: Create OCM connection and fetch target cluster
+	ocmClient, cluster, clusterID, err := setupOCMConnection(o.clusterID)
 	if err != nil {
 		return err
 	}
 	defer ocmClient.Close()
-	cluster, err := utils.GetClusterAnyStatus(ocmClient, o.clusterID)
+	o.clusterID = clusterID
+
+	// Setup: Build Hive OCM config if provided
+	hiveOCMCfg, err := setupHiveOCMConfig(o.hiveOcmConfigPath, o.hiveOcmURL)
 	if err != nil {
-		fmt.Printf("Failed to fetch cluster '%s' from OCM, err:'%v'", o.clusterID, err)
-		return err
-	}
-	clusterID := cluster.ID()
-	if o.clusterID != clusterID {
-		fmt.Printf("Using internal ID:'%s' for provided cluster:'%s'\n", clusterID, o.clusterID)
-		o.clusterID = clusterID
-	}
-
-	fmt.Printf("Fetched cluster from OCM:'%s'\n", clusterID)
-	printDiv()
-
-	// Test building all the OCM config from a provided file path...
-	if len(o.hiveOcmConfigPath) > 0 {
-		fmt.Printf("Attempting to build OCM config from provided file path...\n")
-		hiveOCMCfg, err = utils.GetOcmConfigFromFilePath(o.hiveOcmConfigPath)
-		if err != nil {
-			fmt.Printf("Failed to build Hive OCM config from file path:'%s'\n", o.hiveOcmConfigPath)
-			return err
-		}
-	}
-
-	// Test replacing just the OCM URL for an already built config...
-	if len(o.hiveOcmURL) > 0 {
-		if hiveOCMCfg == nil {
-			fmt.Printf("Attempting to build OCM config...\n")
-			hiveOCMCfg, err = utils.GetOCMConfigFromEnv()
-			if err != nil {
-				fmt.Printf("Failed to build OCM config from legacy function\n")
-				return err
-			}
-		}
-		hiveOCMCfg.URL = o.hiveOcmURL
-	}
-
-	// Test connecting using OCM config...
-	if hiveOCMCfg != nil {
-		hiveBuilder, err := utils.GetOCMSdkConnBuilderFromConfig(hiveOCMCfg)
-		if err != nil {
-			fmt.Printf("Failed to create sdk connection builder from hive ocm cfg, err:'%s'\n", err)
-			return err
-		}
-		hiveOCM, err = hiveBuilder.Build()
-		//hiveOCM, err = utils.OCMSdkConnFromFilePath(o.hiveOcmConfigPath)
-		if err != nil {
-			fmt.Printf("Error connecting to OCM env using config at: '%s'\nErr:%v", o.hiveOcmConfigPath, err)
-			return err
-		}
-		fmt.Printf("Built OCM config and connection from provided config inputs\n")
-		printDiv()
-	}
-
-	// No OCM related config provided, this will test the legacy path(s)...
-	if hiveOCM == nil {
-		fmt.Println("---- No hive config provided. Using same OCM connections for target cluster and hive ----")
-		hiveOCM = ocmClient
-		_, err = utils.GetHiveCluster(clusterID)
-		if err != nil {
-			fmt.Printf("Failed to fetch hive cluster from OCM with legacy function, err:'%v'", err)
-			return err
-		}
-	}
-
-	printDiv()
-	hiveCluster, err = utils.GetHiveClusterWithConn(clusterID, ocmClient, hiveOCM)
-	if err != nil {
-		fmt.Printf("Failed to fetch hive cluster with provided OCM conneciton, err:'%v'", err)
 		return err
 	}
 
-	fmt.Printf("Got Hive Cluster from OCM:'%s'\n", hiveCluster.ID())
-	printDiv()
+	// Setup: Create Hive OCM connection if config was built
+	hiveOCM, err := setupHiveOCMConnection(hiveOCMCfg, o.hiveOcmConfigPath)
+	if err != nil {
+		return err
+	}
 
-	fmt.Println("Attempting to create and test Kube Client with k8s.New()...")
-	kubeClient, err := k8s.New(clusterID, client.Options{})
-	if err != nil {
-		return fmt.Errorf("failed to login to cluster:'%s', err: %w", clusterID, err)
-	}
-	fmt.Printf("Created client connection to target cluster:'%s', '%s'\n", cluster.ID(), cluster.Name())
-	// Test an API call to this cluster, dump the cluster operators...
-	err = dumpClusterOperators(kubeClient)
+	// Setup: Fetch Hive cluster
+	hiveCluster, err := setupHiveCluster(clusterID, ocmClient, hiveOCM)
 	if err != nil {
 		return err
 	}
-	fmt.Println("Create and test Kube Client with k8s.New() - PASS")
-	printDiv()
 
-	fmt.Println("Attempting to create and test Kube Client with k8s.NewWithConn()...")
-	hiveClient, err := k8s.NewWithConn(hiveCluster.ID(), client.Options{}, hiveOCM)
-	if err != nil {
-		return fmt.Errorf("failed to login to hive cluster:'%s', err %w", hiveCluster.ID(), err)
-	}
-	fmt.Printf("Created client connection to HIVE cluster:'%s', '%s'\n", hiveCluster.ID(), hiveCluster.Name())
-	// Test an API call to this cluster, dump the cluster operators...
-	err = dumpClusterOperators(hiveClient)
-	if err != nil {
+	// Run individual tests
+	if err := testK8sNew(clusterID, cluster); err != nil {
 		return err
 	}
-	fmt.Println("Create and test Kube Client with k8s.NewWithConn() - PASS")
-	printDiv()
 
-	fmt.Println("Attempting to create and test Kube Client with k8s.NewAsBackplaneClusterAdminWithConn()...")
-	hiveAdminClient, err := k8s.NewAsBackplaneClusterAdminWithConn(hiveCluster.ID(), client.Options{}, hiveOCM, o.reason)
-	if err != nil {
-		return fmt.Errorf("failed to login to hive cluster:'%s', err %w", hiveCluster.ID(), err)
-	}
-	fmt.Printf("Created 'ClusterAdmin' client connection to HIVE cluster:'%s', '%s'\n", hiveCluster.ID(), hiveCluster.Name())
-	// Test an elevated API call to this cluster, dump the cluster operators...
-	clusterDep, err := getClusterDeployment(hiveAdminClient, clusterID)
-	if err != nil {
+	if err := testK8sNewWithConn(hiveCluster, hiveOCM); err != nil {
 		return err
 	}
-	fmt.Printf("Fetched ClusterDeployment:'%s/%s' for cluster:'%s' from HIVE using elevated client\n", clusterDep.Namespace, clusterDep.Name, clusterID)
-	fmt.Println("Create and test Kube Client withk8s.NewAsBackplaneClusterAdminWithConn() - PASS")
-	printDiv()
 
-	fmt.Printf("Testing non-backplane-admin client, clientSet GetKubeConfigAndClient() for cluster:'%s'\n", clusterID)
-	kubeCli, _, kubeClientSet, err := common.GetKubeConfigAndClient(clusterID)
-	// Test an API call to this cluster, dump the cluster operators...
-	err = dumpClusterOperators(kubeCli)
-	if err != nil {
+	if err := testK8sNewAsBackplaneClusterAdmin(hiveCluster, hiveOCM, clusterID, o.reason); err != nil {
 		return err
 	}
-	nsList, err := kubeClientSet.CoreV1().Namespaces().List(context.TODO(), metav1.ListOptions{})
-	if err != nil {
-		fmt.Printf("ClientSet list namespaces failed, err:'%v'\n", err)
-		return err
-	}
-	fmt.Printf("Got '%d' namespaces\n", len(nsList.Items))
-	fmt.Println("non-bpadmin Create and test Kube Client, Clientset with GetKubeConfigAndClient() - PASS")
-	printDiv()
 
-	fmt.Printf("Testing non-backplane-admin client, clientset GetKubeConfigAndClientWithConn for cluster:'%s'\n", clusterID)
-	kubeCli, _, kubeClientSet, err = common.GetKubeConfigAndClientWithConn(clusterID, ocmClient)
-	// Test an API call to this cluster, dump the cluster operators...
-	err = dumpClusterOperators(kubeCli)
-	if err != nil {
+	if err := testGetKubeConfigAndClient(clusterID); err != nil {
 		return err
 	}
-	nsList, err = kubeClientSet.CoreV1().Namespaces().List(context.TODO(), metav1.ListOptions{})
-	if err != nil {
-		fmt.Printf("ClientSet list namespaces failed, err:'%v'\n", err)
-		return err
-	}
-	fmt.Printf("Got '%d' namespaces\n", len(nsList.Items))
-	fmt.Println("non-bpadmin Create and test Kube Client, Clientset with GetKubeConfigAndClientWithConn() - PASS")
-	printDiv()
 
-	fmt.Printf("Testing backplane-admin client, clientset GetKubeConfigAndClient() for cluster:'%s'\n", clusterID)
-	kubeCli, _, kubeClientSet, err = common.GetKubeConfigAndClient(clusterID, o.reason)
-	// Test an API call to this cluster, dump the cluster operators...
-	err = dumpClusterOperators(kubeCli)
-	if err != nil {
+	if err := testGetKubeConfigAndClientWithConn(clusterID, ocmClient); err != nil {
 		return err
 	}
-	OpenshiftMonitoringNamespace := "openshift-monitoring"
-	podList, err := kubeClientSet.CoreV1().Pods(OpenshiftMonitoringNamespace).List(context.TODO(), metav1.ListOptions{})
-	if err != nil {
-		fmt.Printf("ClientSet list 'openshift-monitoring' pods failed, err:'%v'\n", err)
-		return err
-	}
-	fmt.Printf("Got %d pods in namespace:'%s' :\n", len(podList.Items), OpenshiftMonitoringNamespace)
-	for i, pod := range podList.Items {
-		fmt.Printf("Got pod (%d/%d): '%s/%s' \n", i, len(podList.Items), pod.Namespace, pod.Name)
-	}
-	fmt.Println("bpadmin Create and test Kube Client, Clientset with GetKubeConfigAndClient() - PASS")
-	printDiv()
 
-	fmt.Printf("Testing backplane-admin GetKubeConfigAndClientWithConn() for cluster:'%s'\n", clusterID)
-	kubeCli, _, kubeClientSet, err = common.GetKubeConfigAndClientWithConn(clusterID, ocmClient, o.reason)
-	// Test an API call to this cluster, dump the cluster operators...
-	err = dumpClusterOperators(kubeCli)
-	if err != nil {
+	if err := testGetKubeConfigAndClientAdmin(clusterID, o.reason); err != nil {
 		return err
 	}
-	podList, err = kubeClientSet.CoreV1().Pods("openshift-monitoring").List(context.TODO(), metav1.ListOptions{})
-	if err != nil {
-		fmt.Printf("ClientSet list 'openshift-monitoring' pods failed, err:'%v'\n", err)
-		return err
-	}
-	fmt.Printf("Got %d pods\n", len(podList.Items))
-	for i, pod := range podList.Items {
-		fmt.Printf("Got pod (%d/%d): '%s/%s' \n", i, len(podList.Items), pod.Namespace, pod.Name)
-	}
-	fmt.Println("bpadmin Create and test Kube Client, Clientset with GetKubeConfigAndClientWithConn() - PASS")
-	printDiv()
-	fmt.Printf("Testing GetHiveBPForCluster() hive backplane connection w/o elevation\n")
-	hiveBP, err := utils.GetHiveBPForCluster(clusterID, client.Options{}, "", o.hiveOcmURL)
-	if err != nil {
-		return err
-	}
-	// Test an API call to this hive cluster, dump the cluster operators...
-	err = dumpClusterOperators(hiveBP)
-	if err != nil {
-		return err
-	}
-	fmt.Println("Create and test GetHiveBPForCluster() without elevation reason - PASS")
-	printDiv()
 
-	fmt.Printf("Testing GetHiveBPForCluster() hive backplane connection w/o elevation\n")
-	hiveBP, err = utils.GetHiveBPForCluster(clusterID, client.Options{}, "Testing hive client backplane connections", o.hiveOcmURL)
-	if err != nil {
+	if err := testGetKubeConfigAndClientWithConnAdmin(clusterID, ocmClient, o.reason); err != nil {
 		return err
 	}
-	// Test an API call to this hive cluster, dump the cluster operators...
-	err = dumpClusterOperators(hiveBP)
-	if err != nil {
+
+	if err := testGetHiveBPWithoutElevation(clusterID, o.hiveOcmURL); err != nil {
 		return err
 	}
-	// Test an elevated API call to this cluster, dump the cluster operators...
-	clusterDep, err = getClusterDeployment(hiveBP, clusterID)
-	if err != nil {
+
+	if err := testGetHiveBPWithElevation(clusterID, "Testing hive client backplane connections", o.hiveOcmURL); err != nil {
 		return err
 	}
-	fmt.Printf("Fetched ClusterDeployment:'%s/%s' for cluster:'%s' from HIVE using elevated client\n", clusterDep.Namespace, clusterDep.Name, clusterID)
-	fmt.Println("Create and test GetHiveBPForCluster() with elevation reason - PASS")
-	printDiv()
+
 	fmt.Println("All tests Passed")
 	return nil
 }
