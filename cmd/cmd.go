@@ -40,6 +40,7 @@ import (
 	"github.com/openshift/osdctl/internal/utils/globalflags"
 	"github.com/openshift/osdctl/pkg/k8s"
 	"github.com/openshift/osdctl/pkg/provider/aws"
+	"github.com/openshift/osdctl/test/integration"
 	"github.com/openshift/osdctl/pkg/utils"
 )
 
@@ -94,6 +95,9 @@ func NewCmdRoot(streams genericclioptions.IOStreams) *cobra.Command {
 	rootCmd.AddCommand(cluster.NewCmdCluster(streams, kubeClient, globalOpts))
 	rootCmd.AddCommand(env.NewCmdEnv())
 	rootCmd.AddCommand(hive.NewCmdHive(streams, kubeClient))
+	if integrationTestsCmd := integration.NewCmdIntegrationTests(streams); integrationTestsCmd != nil {
+		rootCmd.AddCommand(integrationTestsCmd)
+	}
 	rootCmd.AddCommand(jira.Cmd)
 	rootCmd.AddCommand(jumphost.NewCmdJumphost())
 	rootCmd.AddCommand(mc.NewCmdMC())
