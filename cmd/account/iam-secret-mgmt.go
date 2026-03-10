@@ -151,6 +151,7 @@ type rotateCredOptions struct {
 	clusterKubeClient client.Client         // Cluster BP kube client connection
 	clusterClientset  *kubernetes.Clientset // Cluster BP Kube ClientSet
 	ocmConn           *sdk.Connection       // ocm connection object
+	hiveOcmConn       *sdk.Connection       // ocm connection object for hive (multi-env support)
 	hiveCluster       *cmv1.Cluster         // Hive cluster/shard managing this user cluster
 	hiveKubeClient    client.Client         // Hive kube client conneciton
 
@@ -577,6 +578,14 @@ func (o *rotateCredOptions) postRunCleanup() error {
 		}
 		o.ocmConn = nil
 	}
+	// Close hive ocm connection if created...
+	if o.hiveOcmConn != nil {
+		ocmCloseErr := o.hiveOcmConn.Close()
+		if ocmCloseErr != nil {
+			return fmt.Errorf("error during hive ocm.close() (possible memory leak): %q", ocmCloseErr)
+		}
+		o.hiveOcmConn = nil
+	}
 	return nil
 }
 
@@ -694,14 +703,14 @@ func (o *rotateCredOptions) connectHiveClient() error {
 	if o.hiveOcmUrl != "" {
 		// Multi-environment path - enables staging/integration testing
 		// Create separate OCM connection for Hive cluster
-		hiveOCM, err := utils.CreateConnectionWithUrl(o.hiveOcmUrl)
+		var err error
+		o.hiveOcmConn, err = utils.CreateConnectionWithUrl(o.hiveOcmUrl)
 		if err != nil {
 			return fmt.Errorf("failed to create OCM connection for hive (OCM URL:'%s'): %w", o.hiveOcmUrl, err)
 		}
-		defer hiveOCM.Close()
 
 		// Get hive cluster using separate connections
-		hiveCluster, err := utils.GetHiveClusterWithConn(o.clusterID, o.ocmConn, hiveOCM)
+		hiveCluster, err := utils.GetHiveClusterWithConn(o.clusterID, o.ocmConn, o.hiveOcmConn)
 		if err != nil {
 			o.log.Warn(o.ctx, "error fetching hive for cluster:'%s' (OCM URL:'%s'): %v\n", o.clusterID, o.hiveOcmUrl, err)
 			return fmt.Errorf("failed to get hive cluster (OCM URL:'%s'): %w", o.hiveOcmUrl, err)
@@ -713,7 +722,7 @@ func (o *rotateCredOptions) connectHiveClient() error {
 		o.log.Info(o.ctx, "Using Hive Cluster: '%s' (OCM URL:'%s')\n", hiveCluster.ID(), o.hiveOcmUrl)
 
 		// Create hive client with separate OCM connection
-		hiveKubeCli, _, _, err := common.GetKubeConfigAndClientWithConn(o.hiveCluster.ID(), hiveOCM, elevationReasons...)
+		hiveKubeCli, _, _, err := common.GetKubeConfigAndClientWithConn(o.hiveCluster.ID(), o.hiveOcmConn, elevationReasons...)
 		if err != nil {
 			o.log.Warn(o.ctx, "Err fetching hive cluster client, GetKubeConfigAndClientWithConn() err:'%+v'\n", err)
 			return fmt.Errorf("failed to create hive k8s client (OCM URL:'%s'): %w", o.hiveOcmUrl, err)
