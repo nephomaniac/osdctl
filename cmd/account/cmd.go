@@ -35,6 +35,7 @@ func NewCmdAccount(streams genericclioptions.IOStreams, client *k8s.LazyClient, 
 	accountCmd.AddCommand(newCmdVerifySecrets(streams, client))
 	accountCmd.AddCommand(newCmdRotateSecret(streams, client))
 	accountCmd.AddCommand(newCmdGenerateSecret(streams, client))
+	accountCmd.AddCommand(newCmdRotateAWSCreds(streams))
 
 	return accountCmd
 }
