@@ -31,10 +31,21 @@ import (
 func newCmdRotateSecret(streams genericclioptions.IOStreams, client *k8s.LazyClient) *cobra.Command {
 	ops := newRotateSecretOptions(streams, client)
 	rotateSecretCmd := &cobra.Command{
-		Use:               "rotate-secret <aws-account-cr-name>",
-		Short:             "Rotate IAM credentials secret",
-		Long:              "When logged into a hive shard, this rotates IAM credential secrets for a given `account` CR.",
+		Use:   "rotate-secret <aws-account-cr-name>",
+		Short: "Rotate IAM credentials secret (DEPRECATED)",
+		Long: `DEPRECATED: This command is deprecated in favor of 'osdctl account iam-secret-mgmt'.
+
+The new iam-secret-mgmt command provides the same functionality with improved usability:
+- Accepts cluster ID instead of AWS account CR name
+- Automatically connects to the correct Hive shard
+- Supports multi-environment OCM configurations
+- Provides inspection capabilities (--describe-keys, --describe-secrets)
+
+Please use 'osdctl account iam-secret-mgmt' for new operations.
+
+When logged into a hive shard, this rotates IAM credential secrets for a given 'account' CR.`,
 		DisableAutoGenTag: true,
+		Deprecated:        "use 'osdctl account iam-secret-mgmt' instead",
 		Run: func(cmd *cobra.Command, args []string) {
 			cmdutil.CheckErr(ops.complete(cmd, args))
 			cmdutil.CheckErr(ops.run())
@@ -94,6 +105,9 @@ func (o *rotateSecretOptions) complete(cmd *cobra.Command, args []string) error 
 }
 
 func (o *rotateSecretOptions) run() error {
+	fmt.Fprintln(o.Out, "WARNING: This command is deprecated. Please use 'osdctl account iam-secret-mgmt' instead.")
+	fmt.Fprintln(o.Out, "The new command provides improved usability and supports multi-environment OCM configurations.")
+	fmt.Fprintln(o.Out, "")
 
 	ctx := context.TODO()
 	var err error

@@ -31,10 +31,10 @@ AWS Account related utilities
 * [osdctl account console](osdctl_account_console.md)	 - Generate an AWS console URL on the fly
 * [osdctl account generate-secret](osdctl_account_generate-secret.md)	 - Generates IAM credentials secret
 * [osdctl account get](osdctl_account_get.md)	 - Get resources
+* [osdctl account iam-secret-mgmt](osdctl_account_iam-secret-mgmt.md)	 - Rotate IAM credentials and secrets
 * [osdctl account list](osdctl_account_list.md)	 - List resources
 * [osdctl account mgmt](osdctl_account_mgmt.md)	 - AWS Account Management
 * [osdctl account reset](osdctl_account_reset.md)	 - Reset AWS Account CR
-* [osdctl account rotate-secret](osdctl_account_rotate-secret.md)	 - Rotate IAM credentials secret
 * [osdctl account servicequotas](osdctl_account_servicequotas.md)	 - Interact with AWS service-quotas
 * [osdctl account set](osdctl_account_set.md)	 - Set AWS Account CR status
 * [osdctl account verify-secrets](osdctl_account_verify-secrets.md)	 - Verify AWS Account CR IAM User credentials

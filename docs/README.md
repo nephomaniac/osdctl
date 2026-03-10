@@ -15,6 +15,7 @@
     - `aws-account` - Get AWS Account ID
     - `legal-entity` - Get AWS Account Legal Entity
     - `secrets` - Get AWS Account CR related secrets
+  - `iam-secret-mgmt <clusterId> --reason <reason> <options>` - Rotate IAM credentials and secrets
   - `list` - List resources
     - `account` - List AWS Account CR
     - `account-claim` - List AWS Account Claim CR
@@ -24,7 +25,6 @@
     - `list` - List out accounts for username
     - `unassign` - Unassign account to user
   - `reset <account name>` - Reset AWS Account CR
-  - `rotate-secret <aws-account-cr-name>` - Rotate IAM credentials secret
   - `servicequotas` - Interact with AWS service-quotas
     - `describe` - Describe AWS service-quotas
   - `set <account name>` - Set AWS Account CR status
@@ -519,6 +519,53 @@ osdctl account get secrets [flags]
   -S, --skip-version-check               skip checking to see if this is the most recent release
 ```
 
+### osdctl account iam-secret-mgmt
+
+
+Util to rotate managed IAM credentials and related secrets for a given cluster account.
+Please use with caution!
+'Rotate': operations are intended to be somewhat interactive and will provide information 
+followed by prompting the user to verify if and/or how to proceed. 
+'Describe': operations 
+are intended to provide info and status related to the artifacts to be rotated. 
+
+These operations require the following:
+	- A valid cluster-id (not an alias)
+	- An elevation reason (hint: This will usually involve a Jira ticket ID.)  
+	- A local AWS profile for the cluster environment (ie: osd-staging, rhcontrol, etc), if not provided 'default' is used. 
+	- A valid OCM token and OCM_CONFIG.  
+
+
+```
+osdctl account iam-secret-mgmt <clusterId> --reason <reason> <options> [flags]
+```
+
+#### Flags
+
+```
+      --admin-username osdManagedAdmin*   The admin username to use for generating access keys. Must be in the format of osdManagedAdmin*. If not specified, this is inferred from the account CR.
+      --as string                         Username to impersonate for the operation. User could be a regular user or a service account in a namespace.
+  -p, --aws-profile string                specify AWS profile from local config to use(default='default')
+      --cluster string                    The name of the kubeconfig cluster to use
+      --context string                    The name of the kubeconfig context to use
+      --describe-keys                     Print AWS AccessKey info for osdManagedAdmin and osdCcsAdmin relevant cred rotation, and exit
+      --describe-secrets                  Print AWS CredentialRequests ref'd secrets info relecant to cred rotation, and exit
+  -h, --help                              help for iam-secret-mgmt
+      --hive-ocm-url string               (optional) OCM environment URL for hive operations. Aliases: 'production', 'staging', 'integration'. If not specified, uses the same OCM environment as the target cluster.
+      --insecure-skip-tls-verify          If true, the server's certificate will not be checked for validity. This will make your HTTPS connections insecure
+      --kubeconfig string                 Path to the kubeconfig file to use for CLI requests.
+  -o, --output string                     Valid formats are ['', 'json', 'yaml', 'env']
+  -r, --reason string                     (Required) The reason for this command, which requires elevation, to be run (usually an OHSS or PD ticket).
+      --request-timeout string            The length of time to wait before giving up on a single server request. Non-zero values should contain a corresponding time unit (e.g. 1s, 2m, 3h). A value of zero means don't timeout requests. (default "0")
+      --rotate-ccs-admin                  Rotate osdCcsAdmin user credentials. Interactive. Use caution!
+      --rotate-managed-admin              Rotate osdManagedAdmin user credentials. Interactive. Use caution.
+      --save-keys                         Save 'newly created' secret access key contents stdout output during execution
+  -s, --server string                     The address and port of the Kubernetes API server
+      --skip-aws-proxy-check aws_proxy    Don't use the configured aws_proxy value
+  -S, --skip-version-check                skip checking to see if this is the most recent release
+  -v, --verbose int                       debug=4, (default)info=3, warn=2, error=1 (default 3)
+```
+
 ### osdctl account list
 
 List resources
@@ -763,34 +810,6 @@ osdctl account reset <account name> [flags]
   -s, --server string                    The address and port of the Kubernetes API server
       --skip-aws-proxy-check aws_proxy   Don't use the configured aws_proxy value
   -S, --skip-version-check               skip checking to see if this is the most recent release
-```
-
-### osdctl account rotate-secret
-
-When logged into a hive shard, this rotates IAM credential secrets for a given `account` CR.
-
-```
-osdctl account rotate-secret <aws-account-cr-name> [flags]
-```
-
-#### Flags
-
-```
-      --admin-username osdManagedAdmin*   The admin username to use for generating access keys. Must be in the format of osdManagedAdmin*. If not specified, this is inferred from the account CR.
-      --as string                         Username to impersonate for the operation. User could be a regular user or a service account in a namespace.
-  -p, --aws-profile string                specify AWS profile
-      --ccs                               Also rotates osdCcsAdmin credential. Use caution.
-      --cluster string                    The name of the kubeconfig cluster to use
-      --context string                    The name of the kubeconfig context to use
-  -h, --help                              help for rotate-secret
-      --insecure-skip-tls-verify          If true, the server's certificate will not be checked for validity. This will make your HTTPS connections insecure
-      --kubeconfig string                 Path to the kubeconfig file to use for CLI requests.
-  -o, --output string                     Valid formats are ['', 'json', 'yaml', 'env']
-      --reason string                     The reason for this command, which requires elevation, to be run (usually an OHSS or PD ticket)
-      --request-timeout string            The length of time to wait before giving up on a single server request. Non-zero values should contain a corresponding time unit (e.g. 1s, 2m, 3h). A value of zero means don't timeout requests. (default "0")
-  -s, --server string                     The address and port of the Kubernetes API server
-      --skip-aws-proxy-check aws_proxy    Don't use the configured aws_proxy value
-  -S, --skip-version-check                skip checking to see if this is the most recent release
 ```
 
 ### osdctl account servicequotas

@@ -153,7 +153,7 @@ type rotateCredOptions struct {
 	ocmConn           *sdk.Connection       // ocm connection object
 	hiveOcmConn       *sdk.Connection       // ocm connection object for hive (multi-env support)
 	hiveCluster       *cmv1.Cluster         // Hive cluster/shard managing this user cluster
-	hiveKubeClient    client.Client         // Hive kube client conneciton
+	hiveKubeClient    client.Client         // Hive kube client connection
 
 }
 
@@ -175,7 +175,7 @@ func (o *rotateCredOptions) preRunCliChecks(cmd *cobra.Command, args []string) e
 	o.awsAccountTimeout = awsSdk.Int32(900)
 
 	if o.osdManagedAdminUsername != "" && !strings.HasPrefix(o.osdManagedAdminUsername, common.OSDManagedAdminIAM) {
-		return cmdutil.UsageErrorf(cmd, fmt.Sprintf("admin-username must start with %v", common.OSDManagedAdminIAM))
+		return cmdutil.UsageErrorf(cmd, "admin-username must start with %v", common.OSDManagedAdminIAM)
 	}
 
 	if o.profile == "" {
@@ -203,6 +203,14 @@ func (o *rotateCredOptions) preRunCliChecks(cmd *cobra.Command, args []string) e
 		return cmdutil.UsageErrorf(cmd, "can not combine 'describe*' with 'rotate*' commands")
 	}
 
+	// Validate --hive-ocm-url if provided
+	if o.hiveOcmUrl != "" {
+		_, err := utils.ValidateAndResolveOcmUrl(o.hiveOcmUrl)
+		if err != nil {
+			return fmt.Errorf("invalid --hive-ocm-url: %w", err)
+		}
+	}
+
 	if o.saveSecretKeyToFile {
 		if o.updateCcsCredsCli && fileExists(saveFileCcs) {
 			return fmt.Errorf("--save-keys: file '%s' already present, please move/remove before running", saveFileCcs)
@@ -223,13 +231,16 @@ func (o *rotateCredOptions) preRunCliChecks(cmd *cobra.Command, args []string) e
 
 /* Main function used to run this CLI utility */
 func (o *rotateCredOptions) run() error {
-	var err error = nil
-	err = o.preRunSetup()
+	err := o.preRunSetup()
 	if err != nil {
 		return err
 	}
 	// defer the command cleanup...
-	defer o.postRunCleanup()
+	defer func() {
+		if cleanupErr := o.postRunCleanup(); cleanupErr != nil {
+			o.log.Error(context.TODO(), "Failed to cleanup: %v", cleanupErr)
+		}
+	}()
 
 	err = o.printClusterInfo()
 	if err != nil {
@@ -284,7 +295,9 @@ func (o *rotateCredOptions) run() error {
 		return nil
 	}
 	// Display cluster info, let user confirm they are on the correct cluster, etc...
-	o.printClusterInfo()
+	if err := o.printClusterInfo(); err != nil {
+		return err
+	}
 	fmt.Println("Proceed with Managed Admin AWS credentials rotation on this cluster?")
 	if !utils.ConfirmPrompt() {
 		fmt.Println("User quit.")
@@ -470,11 +483,13 @@ func (o *rotateCredOptions) deleteAWSCredRequestSecrets() error {
 	}
 	fmt.Printf("\nAWS CredentialRequest referenced secrets to be deleted:\n")
 	// Print secrets info for user to review before choosing to continue
-	o.printAWSCredRequestSecrets(&awsCredReqs)
+	if err := o.printAWSCredRequestSecrets(&awsCredReqs); err != nil {
+		return err
+	}
 	fmt.Println("Please review above credentialRequest Secrets to be deleted.")
 	fmt.Println("(DO NOT CONTINUE IF ANYTHING LOOKS AMISS)")
 	fmt.Println("Are you sure you want to continue?")
-	var userInput string = ""
+	var userInput = ""
 	w := tabwriter.NewWriter(os.Stdout, 1, 1, 1, ' ', 0)
 inputLoop:
 	for {
@@ -500,9 +515,8 @@ inputLoop:
 		}
 	}
 	if userInput == "y" || userInput == "all" {
-		var idx = 0
 		for sidx, cr := range awsCredReqs {
-			idx = sidx + 1
+			idx := sidx + 1
 			secret, err := o.clusterClientset.CoreV1().Secrets(cr.Spec.SecretRef.Namespace).Get(context.TODO(), cr.Spec.SecretRef.Name, metav1.GetOptions{})
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error getting secret:'%s', skipping\n", secret.Name)
@@ -556,7 +570,7 @@ func (o *rotateCredOptions) preRunSetup() error {
 	// Store the cluster obj...
 	o.cluster = cluster
 	// Validate that the UUID and not an Alias was provided by the user per cli input...
-	if !(o.clusterID == cluster.ID() || o.clusterID == cluster.ExternalID()) {
+	if o.clusterID != cluster.ID() && o.clusterID != cluster.ExternalID() {
 		return fmt.Errorf("cluster id:'%s', does not match internal:'%s' or external:'%s' IDs. No aliases allowed", o.clusterID, cluster.ID(), cluster.ExternalID())
 	}
 
@@ -591,8 +605,7 @@ func (o *rotateCredOptions) postRunCleanup() error {
 
 /* populate aws account claim name info */
 func (o *rotateCredOptions) fetchAwsClaimNameInfo() error {
-	var err error = nil
-	var claimName string = ""
+	var claimName string
 	accountClaim, err := k8s.GetAccountClaimFromClusterID(o.ctx, o.hiveKubeClient, o.clusterID)
 	if err != nil {
 		o.log.Warn(o.ctx, "k8s.GetAccountClaimFromClusterID err:'%s', trying resources instead...\n", err)
@@ -626,7 +639,9 @@ func (o *rotateCredOptions) getResourcesClaimName() (string, error) {
 			return "", err
 		}
 	}
-	o.ocmConn.ClustersMgmt().V1().AWSInquiries().STSCredentialRequests().List().Send()
+	if _, err := o.ocmConn.ClustersMgmt().V1().AWSInquiries().STSCredentialRequests().List().Send(); err != nil {
+		return "", fmt.Errorf("error listing STS credential requests: %w", err)
+	}
 	liveResponse, err := o.ocmConn.ClustersMgmt().V1().Clusters().Cluster(o.clusterID).Resources().Live().Get().Send()
 	if err != nil {
 		return "", fmt.Errorf("error fetching cluster resources: %w", err)
@@ -947,8 +962,7 @@ func (o *rotateCredOptions) printKeyInfo(currKeys *iam.ListAccessKeysOutput, cli
 	if currKeys == nil || clientInput == nil {
 		return fmt.Errorf("nil input passed to printKeyInfo()")
 	}
-	var inUseStr string = "unknown?"
-	p := printer.NewTablePrinter(o.IOStreams.Out, 3, 1, 3, ' ')
+	p := printer.NewTablePrinter(o.Out, 3, 1, 3, ' ')
 	headers := []string{"#", "ACCESS-KEY-ID", "CR-IN-USE", "CREATED", "STATUS", "IAM-USER"}
 	p.AddRow(headers)
 
@@ -960,6 +974,7 @@ func (o *rotateCredOptions) printKeyInfo(currKeys *iam.ListAccessKeysOutput, cli
 		if Akey.AccessKeyId == nil {
 			return fmt.Errorf("accessKey *id nil in List AccessKeysOutput provided to printKeyInfo()")
 		}
+		var inUseStr string
 		if len(clientInput.AccessKeyID) > 0 {
 			inUseStr = fmt.Sprintf("%t", clientInput.AccessKeyID == *Akey.AccessKeyId)
 		} else {
@@ -1018,7 +1033,7 @@ func (o *rotateCredOptions) checkAccessKeysMaxDelete(iamUser string, nameSpace s
 				max_attempts := 3
 				for attempt := 1; attempt <= max_attempts; attempt++ {
 					fmt.Print("Enter Access Key ID to delete: ")
-					var keyInput string = ""
+					var keyInput string
 					_, _ = fmt.Scanln(&keyInput)
 					// Basic input validation...?
 					if o.isValidAccessKeyId(keyInput) {
@@ -1190,9 +1205,9 @@ func (o *rotateCredOptions) doRotateManagedAdminAWSCreds() error {
 	}
 
 	if len(clusterDeployments.Items) == 0 {
-		return fmt.Errorf("failed to retreive cluster deployments")
+		return fmt.Errorf("failed to retrieve cluster deployments")
 	}
-	cdName := clusterDeployments.Items[0].ObjectMeta.Name
+	cdName := clusterDeployments.Items[0].Name
 	o.log.Debug(o.ctx, "Got cluster deployment name:'%s'\n", cdName)
 
 	const syncSetName = "aws-sync"
@@ -1231,7 +1246,9 @@ func (o *rotateCredOptions) doRotateManagedAdminAWSCreds() error {
 	}
 
 	fmt.Printf("Watching Cluster Sync Status for deployment...\n")
-	hiveinternalv1alpha1.AddToScheme(o.hiveKubeClient.Scheme())
+	if err := hiveinternalv1alpha1.AddToScheme(o.hiveKubeClient.Scheme()); err != nil {
+		return fmt.Errorf("failed to add hiveinternalv1alpha1 to scheme: %w", err)
+	}
 	searchStatus := &hiveinternalv1alpha1.ClusterSync{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      cdName,
