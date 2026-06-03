@@ -60,6 +60,7 @@
   - `logging-check --cluster-id <cluster-identifier>` - Shows the logging support status of a specified cluster
   - `orgId --cluster-id <cluster-identifier` - Get the OCM org ID for a given cluster
   - `owner` - List the clusters owned by the user (can be specified to any user, not only yourself)
+  - `replace-pull-secret` - Replace a cluster's pull secret with current OCM access token data
   - `reports` - Manage cluster reports in backplane-api
     - `create` - Create a new cluster report in backplane-api
     - `get` - Get a specific cluster report from backplane-api
@@ -1840,6 +1841,41 @@ osdctl cluster owner [flags]
       --skip-aws-proxy-check aws_proxy   Don't use the configured aws_proxy value
   -S, --skip-version-check               skip checking to see if this is the most recent release
   -u, --user-id string                   user to check the cluster owner on
+```
+
+### osdctl cluster replace-pull-secret
+
+Replace a cluster's pull secret with current OCM access token data.
+
+This updates the pull secret on a ROSA HCP or Classic cluster without performing
+an ownership transfer. The pull secret is refreshed using the current cluster
+owner's OCM access token.
+
+See documentation prior to executing:
+https://github.com/openshift/ops-sop/blob/master/hypershift/knowledge_base/howto/replace-pull-secret.md
+https://github.com/openshift/ops-sop/blob/master/v4/howto/transfer_cluster_ownership.md
+
+```
+osdctl cluster replace-pull-secret [flags]
+```
+
+#### Flags
+
+```
+      --as string                        Username to impersonate for the operation. User could be a regular user or a service account in a namespace.
+      --cluster string                   The name of the kubeconfig cluster to use
+  -C, --cluster-id string                The Internal/External Cluster ID or Cluster Name
+      --context string                   The name of the kubeconfig context to use
+  -d, --dry-run                          Dry-run - show what would change but do not apply
+  -h, --help                             help for replace-pull-secret
+      --insecure-skip-tls-verify         If true, the server's certificate will not be checked for validity. This will make your HTTPS connections insecure
+      --kubeconfig string                Path to the kubeconfig file to use for CLI requests.
+  -o, --output string                    Valid formats are ['', 'json', 'yaml', 'env']
+      --reason string                    The reason for this command (usually an OHSS or PD ticket)
+      --request-timeout string           The length of time to wait before giving up on a single server request. Non-zero values should contain a corresponding time unit (e.g. 1s, 2m, 3h). A value of zero means don't timeout requests. (default "0")
+  -s, --server string                    The address and port of the Kubernetes API server
+      --skip-aws-proxy-check aws_proxy   Don't use the configured aws_proxy value
+  -S, --skip-version-check               skip checking to see if this is the most recent release
 ```
 
 ### osdctl cluster reports
