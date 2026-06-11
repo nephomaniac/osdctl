@@ -60,7 +60,9 @@
   - `logging-check --cluster-id <cluster-identifier>` - Shows the logging support status of a specified cluster
   - `orgId --cluster-id <cluster-identifier` - Get the OCM org ID for a given cluster
   - `owner` - List the clusters owned by the user (can be specified to any user, not only yourself)
-  - `replace-pull-secret` - Replace a cluster's pull secret with current OCM access token data
+  - `pull-secret` - Diagnose and manage cluster pull secrets
+    - `replace` - Refresh a cluster's pull secret from the cluster owner's OCM account
+    - `snapshot` - Show pull secret status for all clusters owned by an account
   - `reports` - Manage cluster reports in backplane-api
     - `create` - Create a new cluster report in backplane-api
     - `get` - Get a specific cluster report from backplane-api
@@ -1843,20 +1845,44 @@ osdctl cluster owner [flags]
   -u, --user-id string                   user to check the cluster owner on
 ```
 
-### osdctl cluster replace-pull-secret
+### osdctl cluster pull-secret
 
-Replace a cluster's pull secret with current OCM access token data.
+Subcommands for inspecting and replacing cluster pull secrets.
+
+```
+osdctl cluster pull-secret [flags]
+```
+
+#### Flags
+
+```
+      --as string                        Username to impersonate for the operation. User could be a regular user or a service account in a namespace.
+      --cluster string                   The name of the kubeconfig cluster to use
+      --context string                   The name of the kubeconfig context to use
+  -h, --help                             help for pull-secret
+      --insecure-skip-tls-verify         If true, the server's certificate will not be checked for validity. This will make your HTTPS connections insecure
+      --kubeconfig string                Path to the kubeconfig file to use for CLI requests.
+  -o, --output string                    Valid formats are ['', 'json', 'yaml', 'env']
+      --request-timeout string           The length of time to wait before giving up on a single server request. Non-zero values should contain a corresponding time unit (e.g. 1s, 2m, 3h). A value of zero means don't timeout requests. (default "0")
+  -s, --server string                    The address and port of the Kubernetes API server
+      --skip-aws-proxy-check aws_proxy   Don't use the configured aws_proxy value
+  -S, --skip-version-check               skip checking to see if this is the most recent release
+```
+
+### osdctl cluster pull-secret replace
+
+Refresh a cluster's pull secret from the cluster owner's OCM account.
 
 This updates the pull secret on a ROSA HCP or Classic cluster without performing
-an ownership transfer. The pull secret is refreshed using the current cluster
-owner's OCM access token.
+an ownership transfer. The pull secret is rebuilt from the latest credentials
+in the cluster owner's OCM account.
 
 See documentation prior to executing:
 https://github.com/openshift/ops-sop/blob/master/hypershift/knowledge_base/howto/replace-pull-secret.md
 https://github.com/openshift/ops-sop/blob/master/v4/howto/transfer_cluster_ownership.md
 
 ```
-osdctl cluster replace-pull-secret [flags]
+osdctl cluster pull-secret replace [flags]
 ```
 
 #### Flags
@@ -1867,11 +1893,46 @@ osdctl cluster replace-pull-secret [flags]
   -C, --cluster-id string                The Internal/External Cluster ID or Cluster Name
       --context string                   The name of the kubeconfig context to use
   -d, --dry-run                          Dry-run - show what would change but do not apply
-  -h, --help                             help for replace-pull-secret
+  -h, --help                             help for replace
       --insecure-skip-tls-verify         If true, the server's certificate will not be checked for validity. This will make your HTTPS connections insecure
       --kubeconfig string                Path to the kubeconfig file to use for CLI requests.
   -o, --output string                    Valid formats are ['', 'json', 'yaml', 'env']
       --reason string                    The reason for this command (usually an OHSS or PD ticket)
+      --request-timeout string           The length of time to wait before giving up on a single server request. Non-zero values should contain a corresponding time unit (e.g. 1s, 2m, 3h). A value of zero means don't timeout requests. (default "0")
+  -s, --server string                    The address and port of the Kubernetes API server
+      --skip-aws-proxy-check aws_proxy   Don't use the configured aws_proxy value
+  -S, --skip-version-check               skip checking to see if this is the most recent release
+```
+
+### osdctl cluster pull-secret snapshot
+
+Show pull secret status for all clusters sharing the same OCM account.
+
+Given any cluster ID, resolves the owner account and lists all clusters
+owned by that account. Compares cluster creation dates against the account's
+registry credential update timestamps to flag clusters that may have stale
+pull secrets.
+
+Use --check to drill into a specific cluster and compare its pull secret
+against the current OCM access token auth entries.
+
+```
+osdctl cluster pull-secret snapshot [flags]
+```
+
+#### Flags
+
+```
+      --as string                        Username to impersonate for the operation. User could be a regular user or a service account in a namespace.
+      --check string                     Drill into a specific cluster ID for full pull secret validation
+      --cluster string                   The name of the kubeconfig cluster to use
+  -C, --cluster-id string                Any cluster owned by the account (used to resolve the owner)
+      --context string                   The name of the kubeconfig context to use
+  -h, --help                             help for snapshot
+      --insecure-skip-tls-verify         If true, the server's certificate will not be checked for validity. This will make your HTTPS connections insecure
+      --kubeconfig string                Path to the kubeconfig file to use for CLI requests.
+  -o, --output string                    Valid formats are ['', 'json', 'yaml', 'env']
+      --reason string                    Elevation reason for cluster connections
       --request-timeout string           The length of time to wait before giving up on a single server request. Non-zero values should contain a corresponding time unit (e.g. 1s, 2m, 3h). A value of zero means don't timeout requests. (default "0")
   -s, --server string                    The address and port of the Kubernetes API server
       --skip-aws-proxy-check aws_proxy   Don't use the configured aws_proxy value

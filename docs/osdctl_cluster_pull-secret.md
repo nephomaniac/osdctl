@@ -1,40 +1,15 @@
-## osdctl cluster replace-pull-secret
+## osdctl cluster pull-secret
 
-Refresh a cluster's pull secret from the cluster owner's OCM account
+Diagnose and manage cluster pull secrets
 
 ### Synopsis
 
-Refresh a cluster's pull secret from the cluster owner's OCM account.
-
-This updates the pull secret on a ROSA HCP or Classic cluster without performing
-an ownership transfer. The pull secret is rebuilt from the latest credentials
-in the cluster owner's OCM account.
-
-See documentation prior to executing:
-https://github.com/openshift/ops-sop/blob/master/hypershift/knowledge_base/howto/replace-pull-secret.md
-https://github.com/openshift/ops-sop/blob/master/v4/howto/transfer_cluster_ownership.md
-
-```
-osdctl cluster replace-pull-secret [flags]
-```
-
-### Examples
-
-```
-  # Replace pull secret on a cluster
-  osdctl cluster replace-pull-secret --cluster-id 1kfmyclusterid --reason "OHSS-1234"
-
-  # Dry-run to preview without making changes
-  osdctl cluster replace-pull-secret --cluster-id 1kfmyclusterid --reason "OHSS-1234" --dry-run
-```
+Subcommands for inspecting and replacing cluster pull secrets.
 
 ### Options
 
 ```
-  -C, --cluster-id string   The Internal/External Cluster ID or Cluster Name
-  -d, --dry-run             Dry-run - show what would change but do not apply
-  -h, --help                help for replace-pull-secret
-      --reason string       The reason for this command (usually an OHSS or PD ticket)
+  -h, --help   help for pull-secret
 ```
 
 ### Options inherited from parent commands
@@ -55,4 +30,6 @@ osdctl cluster replace-pull-secret [flags]
 ### SEE ALSO
 
 * [osdctl cluster](osdctl_cluster.md)	 - Provides information for a specified cluster
+* [osdctl cluster pull-secret replace](osdctl_cluster_pull-secret_replace.md)	 - Refresh a cluster's pull secret from the cluster owner's OCM account
+* [osdctl cluster pull-secret snapshot](osdctl_cluster_pull-secret_snapshot.md)	 - Show pull secret status for all clusters owned by an account
 

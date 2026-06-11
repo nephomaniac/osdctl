@@ -1,0 +1,447 @@
+package controller
+
+import (
+	"context"
+	b64 "encoding/base64"
+	"encoding/json"
+	"fmt"
+	"io"
+	"time"
+
+	"github.com/fatih/color"
+	sdk "github.com/openshift-online/ocm-sdk-go"
+	amv1 "github.com/openshift-online/ocm-sdk-go/accountsmgmt/v1"
+	"github.com/sirupsen/logrus"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+
+	"github.com/openshift/osdctl/pkg/utils"
+)
+
+var (
+	psColorOK   = color.New(color.FgGreen).SprintFunc()
+	psColorFail = color.New(color.FgRed).SprintFunc()
+	psColorWarn = color.New(color.FgYellow).SprintFunc()
+)
+
+// RequiredPullSecretAuths lists the registry auth entries that must be present
+// in a cluster's pull secret for the cluster to function.
+var RequiredPullSecretAuths = []string{
+	"cloud.openshift.com",
+	"quay.io",
+	"registry.redhat.io",
+	"registry.connect.redhat.com",
+}
+
+// ClusterSummary holds subscription-level data for a cluster owned by an account.
+type ClusterSummary struct {
+	Name      string
+	ID        string
+	Status    string
+	CreatedAt time.Time
+}
+
+// AuthCheckResult holds the outcome of a single registry auth comparison.
+type AuthCheckResult struct {
+	Registry   string
+	Source     string // "access_token" or "registry_credential"
+	OK         bool
+	TokenMatch bool
+	EmailMatch bool
+	Email      string
+	Detail     string
+}
+
+// PullSecretVerifyResult holds the outcome of a per-registry auth comparison.
+type PullSecretVerifyResult struct {
+	Matched         int
+	Total           int
+	Mismatches      []string
+	AuthResults     []AuthCheckResult
+	MissingRequired []string
+}
+
+// FetchOwnerPullSecret retrieves the cluster owner's pull secret from OCM,
+// using impersonation if the current OCM user is not the cluster owner.
+// Returns the marshaled pull secret bytes and the raw auth map for verification.
+func FetchOwnerPullSecret(ocm *sdk.Connection, ownerUsername string, logger *logrus.Logger) ([]byte, map[string]*amv1.AccessTokenAuth, error) {
+	currentAccountResp, err := ocm.AccountsMgmt().V1().CurrentAccount().Get().Send()
+	if err != nil {
+		logger.Warnf("Could not fetch current account info, will use impersonation: %v", err)
+	}
+
+	var response *amv1.AccessTokenPostResponse
+	if currentAccountResp != nil && currentAccountResp.Body().Username() == ownerUsername {
+		logger.Info("Current OCM user matches cluster owner, fetching access token directly")
+		response, err = ocm.AccountsMgmt().V1().AccessToken().Post().Send()
+	} else {
+		logger.Infof("Impersonating cluster owner '%s' to fetch access token", ownerUsername)
+		response, err = ocm.AccountsMgmt().V1().AccessToken().Post().Impersonate(ownerUsername).Parameter("body", nil).Send()
+	}
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to fetch OCM access token: %w", err)
+	}
+
+	auths, ok := response.Body().GetAuths()
+	if !ok {
+		return nil, nil, fmt.Errorf("failed to get auths from access token response — contact SDB if this persists")
+	}
+
+	authsMap := map[string]map[string]string{}
+	for k, auth := range auths {
+		authsMap[k] = map[string]string{
+			"auth":  auth.Auth(),
+			"email": auth.Email(),
+		}
+	}
+
+	pullSecret, err := json.Marshal(map[string]map[string]map[string]string{
+		"auths": authsMap,
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to marshal pull secret: %w", err)
+	}
+
+	return pullSecret, auths, nil
+}
+
+// ValidateRequiredAuths checks that the OCM access token includes all required
+// registry auth entries. Returns the list of missing registries.
+func ValidateRequiredAuths(auths map[string]*amv1.AccessTokenAuth) []string {
+	var missing []string
+	for _, required := range RequiredPullSecretAuths {
+		if _, ok := auths[required]; !ok {
+			missing = append(missing, required)
+		}
+	}
+	return missing
+}
+
+// VerifyPullSecretAuths compares OCM access token auths against the pull
+// secret on the target cluster. Writes per-registry results to out.
+// Returns a PullSecretVerifyResult with match counts and any mismatches.
+func VerifyPullSecretAuths(ctx context.Context, clientset *kubernetes.Clientset, expectedAuths map[string]*amv1.AccessTokenAuth, out io.Writer) (*PullSecretVerifyResult, error) {
+	pullSecret, err := clientset.CoreV1().Secrets("openshift-config").Get(ctx, "pull-secret", metav1.GetOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get secret openshift-config/pull-secret from target cluster: %w", err)
+	}
+
+	if _, ok := pullSecret.Data[".dockerconfigjson"]; !ok {
+		return nil, fmt.Errorf("secret openshift-config/pull-secret is missing .dockerconfigjson key")
+	}
+
+	result := &PullSecretVerifyResult{Total: len(expectedAuths)}
+
+	for authKey, expectedAuth := range expectedAuths {
+		ar := AuthCheckResult{Registry: authKey, Source: "access_token"}
+
+		clusterAuth, err := extractPullSecretAuth(authKey, pullSecret)
+		if err != nil {
+			result.Mismatches = append(result.Mismatches, authKey)
+			ar.Detail = "not found in cluster secret"
+			result.AuthResults = append(result.AuthResults, ar)
+			continue
+		}
+
+		ar.TokenMatch = clusterAuth.auth == expectedAuth.Auth()
+		ar.EmailMatch = clusterAuth.email == expectedAuth.Email()
+		ar.Email = expectedAuth.Email()
+
+		if !ar.TokenMatch || !ar.EmailMatch {
+			result.Mismatches = append(result.Mismatches, authKey)
+			details := ""
+			if !ar.TokenMatch {
+				details += "token mismatch"
+			}
+			if !ar.EmailMatch {
+				if details != "" {
+					details += ", "
+				}
+				details += fmt.Sprintf("email mismatch (cluster=%q, OCM=%q)", clusterAuth.email, expectedAuth.Email())
+			}
+			ar.Detail = details
+			result.AuthResults = append(result.AuthResults, ar)
+			continue
+		}
+
+		ar.OK = true
+		result.Matched++
+		result.AuthResults = append(result.AuthResults, ar)
+	}
+
+	for _, required := range RequiredPullSecretAuths {
+		if _, err := extractPullSecretAuth(required, pullSecret); err != nil {
+			result.MissingRequired = append(result.MissingRequired, required)
+		}
+	}
+
+	// Write human-readable output if a writer is provided
+	if out != nil {
+		RenderVerifyResult(result, out)
+	}
+
+	return result, nil
+}
+
+// RenderVerifyResult writes the verification result in human-readable format.
+func RenderVerifyResult(result *PullSecretVerifyResult, out io.Writer) {
+	for _, ar := range result.AuthResults {
+		if ar.OK {
+			fmt.Fprintf(out, "  %s %-40s token=match, email=match (%s)\n", psColorOK("[OK]"), ar.Registry, ar.Email)
+		} else {
+			fmt.Fprintf(out, "  %s %-40s %s\n", psColorFail("[FAIL]"), ar.Registry, ar.Detail)
+		}
+	}
+
+	fmt.Fprintf(out, "\n  Verified %d/%d auth entries match\n", result.Matched, result.Total)
+
+	if len(result.MissingRequired) > 0 {
+		fmt.Fprintf(out, "\n%s cluster pull secret is missing required registries:\n", psColorWarn("[WARN]"))
+		for _, m := range result.MissingRequired {
+			fmt.Fprintf(out, "  - %s\n", m)
+		}
+		fmt.Fprintf(out, "The cluster may have issues pulling images or reporting telemetry.\n")
+	} else {
+		fmt.Fprintf(out, "  %s All required registries present in cluster pull secret\n", psColorOK("[OK]"))
+	}
+}
+
+// VerifyRegistryCredentials compares OCM registry credentials against the pull
+// secret on the target cluster. Registry credentials use a different token
+// format (base64-encoded "username:token") than access token auths.
+func VerifyRegistryCredentials(ctx context.Context, ocm *sdk.Connection, clientset *kubernetes.Clientset, accountID string, accountEmail string, out io.Writer) (*PullSecretVerifyResult, error) {
+	creds, err := utils.GetRegistryCredentials(ocm, accountID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch registry credentials: %w", err)
+	}
+	if len(creds) == 0 {
+		return nil, fmt.Errorf("no registry credentials found for account %s", accountID)
+	}
+
+	pullSecret, err := clientset.CoreV1().Secrets("openshift-config").Get(ctx, "pull-secret", metav1.GetOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get secret openshift-config/pull-secret: %w", err)
+	}
+
+	result := &PullSecretVerifyResult{Total: len(creds)}
+
+	for _, cred := range creds {
+		registryID := cred.Registry().ID()
+
+		// Resolve registry name from OCM
+		regResp, err := ocm.AccountsMgmt().V1().Registries().Registry(registryID).Get().Send()
+		if err != nil {
+			ar := AuthCheckResult{Registry: registryID, Source: "registry_credential", Detail: fmt.Sprintf("cannot resolve registry: %v", err)}
+			result.Mismatches = append(result.Mismatches, registryID)
+			result.AuthResults = append(result.AuthResults, ar)
+			continue
+		}
+		regName, _ := regResp.Body().GetName()
+		if regName == "" {
+			regName = registryID
+		}
+
+		ar := AuthCheckResult{Registry: regName, Source: "registry_credential"}
+
+		token, _ := cred.GetToken()
+		username, _ := cred.GetUsername()
+		if token == "" || username == "" {
+			ar.Detail = "missing token or username in OCM registry credential"
+			result.Mismatches = append(result.Mismatches, regName)
+			result.AuthResults = append(result.AuthResults, ar)
+			continue
+		}
+
+		clusterAuth, err := extractPullSecretAuth(regName, pullSecret)
+		if err != nil {
+			ar.Detail = "not found in cluster secret"
+			result.Mismatches = append(result.Mismatches, regName)
+			result.AuthResults = append(result.AuthResults, ar)
+			continue
+		}
+
+		// Registry credential tokens are stored as base64("username:token") in the cluster secret
+		expectedToken := fmt.Sprintf("%s:%s", username, token)
+		clusterTokenDecoded, err := b64.StdEncoding.DecodeString(clusterAuth.auth)
+		if err != nil {
+			ar.Detail = "failed to decode cluster token"
+			result.Mismatches = append(result.Mismatches, regName)
+			result.AuthResults = append(result.AuthResults, ar)
+			continue
+		}
+
+		ar.TokenMatch = expectedToken == string(clusterTokenDecoded)
+		ar.EmailMatch = accountEmail == clusterAuth.email
+		ar.Email = accountEmail
+
+		if !ar.TokenMatch || !ar.EmailMatch {
+			result.Mismatches = append(result.Mismatches, regName)
+			details := ""
+			if !ar.TokenMatch {
+				details += "token mismatch"
+			}
+			if !ar.EmailMatch {
+				if details != "" {
+					details += ", "
+				}
+				details += fmt.Sprintf("email mismatch (cluster=%q, OCM=%q)", clusterAuth.email, accountEmail)
+			}
+			ar.Detail = details
+			result.AuthResults = append(result.AuthResults, ar)
+			continue
+		}
+
+		ar.OK = true
+		result.Matched++
+		result.AuthResults = append(result.AuthResults, ar)
+	}
+
+	if out != nil {
+		RenderVerifyResult(result, out)
+	}
+
+	return result, nil
+}
+
+// PreflightCheck validates that the target cluster's pull-secret exists and is
+// readable before attempting any mutations. All operations are read-only.
+func PreflightCheck(ctx context.Context, clientset *kubernetes.Clientset, isHCP bool, clusterName string, out io.Writer) error {
+	fmt.Fprintf(out, "\nPre-flight checks on %s...\n", clusterName)
+
+	secret, err := clientset.CoreV1().Secrets("openshift-config").Get(ctx, "pull-secret", metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("pre-flight: cannot read secret openshift-config/pull-secret on %s: %w", clusterName, err)
+	}
+
+	if _, ok := secret.Data[".dockerconfigjson"]; !ok {
+		return fmt.Errorf("pre-flight: secret openshift-config/pull-secret on %s exists but is missing .dockerconfigjson key", clusterName)
+	}
+
+	fmt.Fprintf(out, "  %s secret openshift-config/pull-secret exists on %s\n", psColorOK("[OK]"), clusterName)
+	fmt.Fprintf(out, "  %s secret openshift-config/pull-secret has .dockerconfigjson key\n", psColorOK("[OK]"))
+
+	if !isHCP {
+		pods, err := clientset.CoreV1().Pods("openshift-monitoring").List(ctx, metav1.ListOptions{
+			LabelSelector: "app.kubernetes.io/name=telemeter-client",
+		})
+		if err == nil && len(pods.Items) > 0 {
+			fmt.Fprintf(out, "  %s pods openshift-monitoring/telemeter-client found on %s (%d)\n", psColorOK("[OK]"), clusterName, len(pods.Items))
+		} else if err != nil {
+			fmt.Fprintf(out, "  %s could not list pods openshift-monitoring/telemeter-client on %s: %v\n", psColorWarn("[WARN]"), clusterName, err)
+		}
+
+		pods, err = clientset.CoreV1().Pods("openshift-ocm-agent-operator").List(ctx, metav1.ListOptions{
+			LabelSelector: "app=ocm-agent",
+		})
+		if err == nil && len(pods.Items) > 0 {
+			fmt.Fprintf(out, "  %s pods openshift-ocm-agent-operator/ocm-agent found on %s (%d)\n", psColorOK("[OK]"), clusterName, len(pods.Items))
+		} else if err != nil {
+			fmt.Fprintf(out, "  %s could not list pods openshift-ocm-agent-operator/ocm-agent on %s: %v\n", psColorWarn("[WARN]"), clusterName, err)
+		}
+	}
+
+	fmt.Fprintf(out, "  %s Pre-flight checks passed\n", psColorOK("[OK]"))
+	return nil
+}
+
+// CountOwnerClusters returns the number of active clusters owned by the given
+// account ID.
+func CountOwnerClusters(ocm *sdk.Connection, accountID string, logger *logrus.Logger) int {
+	search := fmt.Sprintf("creator.id = '%s' and status != 'Deprovisioned' and status != 'Archived'", accountID)
+	resp, err := ocm.AccountsMgmt().V1().Subscriptions().List().
+		Search(search).
+		Size(1).
+		Send()
+	if err != nil {
+		logger.Debugf("Could not query sibling clusters: %v", err)
+		return 0
+	}
+	return resp.Total()
+}
+
+// ListOwnerSubscriptions returns all active subscriptions for the given account ID.
+func ListOwnerSubscriptions(ocm *sdk.Connection, accountID string) ([]ClusterSummary, error) {
+	search := fmt.Sprintf("creator.id = '%s' and status != 'Deprovisioned' and status != 'Archived'", accountID)
+	resp, err := ocm.AccountsMgmt().V1().Subscriptions().List().
+		Search(search).
+		Size(100).
+		Send()
+	if err != nil {
+		return nil, err
+	}
+
+	var clusters []ClusterSummary
+	for _, sub := range resp.Items().Slice() {
+		name, _ := sub.GetDisplayName()
+		clusterID, _ := sub.GetClusterID()
+		status, _ := sub.GetStatus()
+		createdAt, _ := sub.GetCreatedAt()
+
+		if clusterID == "" {
+			continue
+		}
+
+		clusters = append(clusters, ClusterSummary{
+			Name:      name,
+			ID:        clusterID,
+			Status:    status,
+			CreatedAt: createdAt,
+		})
+	}
+
+	return clusters, nil
+}
+
+// GetLatestCredentialUpdate returns the most recent UpdatedAt time across
+// all registry credentials for the given account.
+func GetLatestCredentialUpdate(ocm *sdk.Connection, accountID string) (time.Time, error) {
+	creds, err := utils.GetRegistryCredentials(ocm, accountID)
+	if err != nil {
+		return time.Time{}, err
+	}
+
+	var latest time.Time
+	for _, cred := range creds {
+		if updated, ok := cred.GetUpdatedAt(); ok {
+			if updated.After(latest) {
+				latest = updated
+			}
+		}
+	}
+	return latest, nil
+}
+
+// pullSecretAuthEntry holds extracted auth data from a cluster pull secret.
+type pullSecretAuthEntry struct {
+	auth  string
+	email string
+}
+
+// extractPullSecretAuth extracts an auth entry from a cluster pull secret by registry name.
+func extractPullSecretAuth(authID string, secret *corev1.Secret) (*pullSecretAuthEntry, error) {
+	dockerConfigJSON, ok := secret.Data[".dockerconfigjson"]
+	if !ok {
+		return nil, fmt.Errorf("secret is missing .dockerconfigjson key")
+	}
+
+	var parsed struct {
+		Auths map[string]struct {
+			Auth  string `json:"auth"`
+			Email string `json:"email"`
+		} `json:"auths"`
+	}
+	if err := json.Unmarshal(dockerConfigJSON, &parsed); err != nil {
+		return nil, fmt.Errorf("failed to parse pull secret JSON: %w", err)
+	}
+
+	entry, found := parsed.Auths[authID]
+	if !found {
+		return nil, fmt.Errorf("auth '%s' not found in pull secret", authID)
+	}
+
+	return &pullSecretAuthEntry{
+		auth:  entry.Auth,
+		email: entry.Email,
+	}, nil
+}

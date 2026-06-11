@@ -1,40 +1,40 @@
-## osdctl cluster replace-pull-secret
+## osdctl cluster pull-secret-status
 
-Refresh a cluster's pull secret from the cluster owner's OCM account
+Show pull secret status for all clusters owned by an account
 
 ### Synopsis
 
-Refresh a cluster's pull secret from the cluster owner's OCM account.
+Show pull secret status for all clusters sharing the same OCM account.
 
-This updates the pull secret on a ROSA HCP or Classic cluster without performing
-an ownership transfer. The pull secret is rebuilt from the latest credentials
-in the cluster owner's OCM account.
+Given any cluster ID, resolves the owner account and lists all clusters
+owned by that account. Compares cluster creation dates against the account's
+registry credential update timestamps to flag clusters that may have stale
+pull secrets.
 
-See documentation prior to executing:
-https://github.com/openshift/ops-sop/blob/master/hypershift/knowledge_base/howto/replace-pull-secret.md
-https://github.com/openshift/ops-sop/blob/master/v4/howto/transfer_cluster_ownership.md
+Use --check to drill into a specific cluster and compare its pull secret
+against the current OCM access token auth entries.
 
 ```
-osdctl cluster replace-pull-secret [flags]
+osdctl cluster pull-secret-status [flags]
 ```
 
 ### Examples
 
 ```
-  # Replace pull secret on a cluster
-  osdctl cluster replace-pull-secret --cluster-id 1kfmyclusterid --reason "OHSS-1234"
+  # Overview of all clusters for the account that owns this cluster
+  osdctl cluster pull-secret-status -C 1kfmyclusterid --reason "OHSS-1234"
 
-  # Dry-run to preview without making changes
-  osdctl cluster replace-pull-secret --cluster-id 1kfmyclusterid --reason "OHSS-1234" --dry-run
+  # Full validation of a specific cluster's pull secret
+  osdctl cluster pull-secret-status -C 1kfmyclusterid --reason "OHSS-1234" --check 2abcothercluster
 ```
 
 ### Options
 
 ```
-  -C, --cluster-id string   The Internal/External Cluster ID or Cluster Name
-  -d, --dry-run             Dry-run - show what would change but do not apply
-  -h, --help                help for replace-pull-secret
-      --reason string       The reason for this command (usually an OHSS or PD ticket)
+      --check string        Drill into a specific cluster ID for full pull secret validation
+  -C, --cluster-id string   Any cluster owned by the account (used to resolve the owner)
+  -h, --help                help for pull-secret-status
+      --reason string       Elevation reason for cluster connections
 ```
 
 ### Options inherited from parent commands

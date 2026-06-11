@@ -1,4 +1,4 @@
-## osdctl cluster replace-pull-secret
+## osdctl cluster pull-secret replace
 
 Refresh a cluster's pull secret from the cluster owner's OCM account
 
@@ -15,17 +15,17 @@ https://github.com/openshift/ops-sop/blob/master/hypershift/knowledge_base/howto
 https://github.com/openshift/ops-sop/blob/master/v4/howto/transfer_cluster_ownership.md
 
 ```
-osdctl cluster replace-pull-secret [flags]
+osdctl cluster pull-secret replace [flags]
 ```
 
 ### Examples
 
 ```
   # Replace pull secret on a cluster
-  osdctl cluster replace-pull-secret --cluster-id 1kfmyclusterid --reason "OHSS-1234"
+  osdctl cluster pull-secret replace --cluster-id 1kfmyclusterid --reason "OHSS-1234"
 
   # Dry-run to preview without making changes
-  osdctl cluster replace-pull-secret --cluster-id 1kfmyclusterid --reason "OHSS-1234" --dry-run
+  osdctl cluster pull-secret replace --cluster-id 1kfmyclusterid --reason "OHSS-1234" --dry-run
 ```
 
 ### Options
@@ -33,7 +33,7 @@ osdctl cluster replace-pull-secret [flags]
 ```
   -C, --cluster-id string   The Internal/External Cluster ID or Cluster Name
   -d, --dry-run             Dry-run - show what would change but do not apply
-  -h, --help                help for replace-pull-secret
+  -h, --help                help for replace
       --reason string       The reason for this command (usually an OHSS or PD ticket)
 ```
 
@@ -54,5 +54,5 @@ osdctl cluster replace-pull-secret [flags]
 
 ### SEE ALSO
 
-* [osdctl cluster](osdctl_cluster.md)	 - Provides information for a specified cluster
+* [osdctl cluster pull-secret](osdctl_cluster_pull-secret.md)	 - Diagnose and manage cluster pull secrets
 

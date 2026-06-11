@@ -43,7 +43,7 @@ Provides information for a specified cluster
 * [osdctl cluster logging-check](osdctl_cluster_logging-check.md)	 - Shows the logging support status of a specified cluster
 * [osdctl cluster orgId](osdctl_cluster_orgId.md)	 - Get the OCM org ID for a given cluster
 * [osdctl cluster owner](osdctl_cluster_owner.md)	 - List the clusters owned by the user (can be specified to any user, not only yourself)
-* [osdctl cluster replace-pull-secret](osdctl_cluster_replace-pull-secret.md)	 - Replace a cluster's pull secret with current OCM access token data
+* [osdctl cluster pull-secret](osdctl_cluster_pull-secret.md)	 - Diagnose and manage cluster pull secrets
 * [osdctl cluster reports](osdctl_cluster_reports.md)	 - Manage cluster reports in backplane-api
 * [osdctl cluster resize](osdctl_cluster_resize.md)	 - resize control-plane/infra nodes
 * [osdctl cluster resync](osdctl_cluster_resync.md)	 - Force a resync of a cluster from Hive

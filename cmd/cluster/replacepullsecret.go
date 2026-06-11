@@ -2,69 +2,134 @@ package cluster
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"regexp"
 
+	"github.com/fatih/color"
 	cmv1 "github.com/openshift-online/ocm-sdk-go/clustersmgmt/v1"
+	amv1 "github.com/openshift-online/ocm-sdk-go/accountsmgmt/v1"
+	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
+	authorizationv1 "k8s.io/api/authorization/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
 	"k8s.io/client-go/kubernetes"
 
-	sdk "github.com/openshift-online/ocm-sdk-go"
-	amv1 "github.com/openshift-online/ocm-sdk-go/accountsmgmt/v1"
+	"go.uber.org/zap/zapcore"
+	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	"github.com/openshift/osdctl/cmd/common"
 	"github.com/openshift/osdctl/cmd/servicelog"
 	"github.com/openshift/osdctl/internal/utils/globalflags"
+	"github.com/openshift/osdctl/pkg/controller"
 	"github.com/openshift/osdctl/pkg/utils"
 )
 
-var reasonPattern = regexp.MustCompile(`(?i)(OHSS|PD|SREP|OSD|SDE|ROSAENG)-\d+`)
+var (
+	reasonPattern = regexp.MustCompile(`(?i)(OHSS|PD|SREP|OSD|SDE|ROSAENG)-\d+`)
 
-// requiredPullSecretAuths lists the registry auth entries that must be present
-// in a cluster's pull secret for the cluster to function. Missing entries
-// indicate an issue with the OCM account or the cluster's pull secret state.
-var requiredPullSecretAuths = []string{
-	"cloud.openshift.com",
-	"quay.io",
-	"registry.redhat.io",
-	"registry.connect.redhat.com",
-}
+	colorOK     = color.New(color.FgGreen).SprintFunc()
+	colorFail   = color.New(color.FgRed).SprintFunc()
+	colorWarn   = color.New(color.FgYellow).SprintFunc()
+	colorDryRun = color.New(color.FgCyan).SprintFunc()
+)
+
+// nolint:gosec
+const replacePullSecUsageTemplate = `Usage:{{if .Runnable}}
+  {{.UseLine}}{{end}}{{if gt (len .Aliases) 0}}
+
+Aliases:
+  {{.NameAndAliases}}{{end}}{{if .HasExample}}
+
+Examples:
+{{.Example}}{{end}}
+
+Required Flags:
+  -C, --cluster-id string   The Internal/External Cluster ID or Cluster Name
+      --reason string        The reason for this command (usually an OHSS or PD ticket)
+
+Optional Flags:
+  -d, --dry-run              Dry-run - show what would change but do not apply
+`
 
 type replacePullSecretOptions struct {
 	clusterID string
 	reason    string
 	dryrun    bool
+	logger    *logrus.Logger
 
 	genericclioptions.IOStreams
 	GlobalOptions *globalflags.GlobalOptions
 }
 
-func newCmdReplacePullSecret(streams genericclioptions.IOStreams, globalOpts *globalflags.GlobalOptions) *cobra.Command {
+// dryRunChecker tracks dry-run status and provides formatted output methods.
+type dryRunChecker struct {
+	out   io.Writer
+	allOK bool
+}
+
+func (d *dryRunChecker) would(format string, args ...any) {
+	fmt.Fprintf(d.out, "%s %s %s\n", colorDryRun("[Dry Run]"), colorDryRun("Would:"), colorDryRun(fmt.Sprintf(format, args...)))
+}
+
+func (d *dryRunChecker) report(ok bool, format string, args ...any) {
+	status := colorOK("[OK]")
+	if !ok {
+		status = colorFail("[FAIL]")
+		d.allOK = false
+	}
+	fmt.Fprintf(d.out, "%s %s %s\n", colorDryRun("[Dry Run]"), status, fmt.Sprintf(format, args...))
+}
+
+func (d *dryRunChecker) info(format string, args ...any) {
+	fmt.Fprintf(d.out, "%s %s\n", colorDryRun("[Dry Run]"), fmt.Sprintf(format, args...))
+}
+
+func newReplacePullSecretLogger() *logrus.Logger {
+	l := logrus.New()
+	l.SetOutput(os.Stderr)
+	l.SetFormatter(&logrus.TextFormatter{
+		FullTimestamp:   true,
+		TimestampFormat: "15:04:05",
+		ForceColors:     true,
+	})
+	l.SetLevel(logrus.InfoLevel)
+	return l
+}
+
+func newCmdReplacePullSecretDeprecated(streams genericclioptions.IOStreams, globalOpts *globalflags.GlobalOptions) *cobra.Command {
+	cmd := newCmdPullSecretUpdate(streams, globalOpts)
+	cmd.Use = "replace-pull-secret"
+	cmd.Deprecated = "use 'osdctl cluster pull-secret update' instead"
+	return cmd
+}
+
+func newCmdPullSecretUpdate(streams genericclioptions.IOStreams, globalOpts *globalflags.GlobalOptions) *cobra.Command {
 	ops := &replacePullSecretOptions{
 		IOStreams:      streams,
 		GlobalOptions: globalOpts,
+		logger:        newReplacePullSecretLogger(),
 	}
 	cmd := &cobra.Command{
-		Use:   "replace-pull-secret",
-		Short: "Replace a cluster's pull secret with current OCM access token data",
-		Long: `Replace a cluster's pull secret with current OCM access token data.
+		Use:   "update",
+		Short: "Refresh a cluster's pull secret from the cluster owner's OCM account",
+		Long: `Refresh a cluster's pull secret from the cluster owner's OCM account.
 
 This updates the pull secret on a ROSA HCP or Classic cluster without performing
-an ownership transfer. The pull secret is refreshed using the current cluster
-owner's OCM access token.
+an ownership transfer. The pull secret is rebuilt from the latest credentials
+in the cluster owner's OCM account.
 
 See documentation prior to executing:
 https://github.com/openshift/ops-sop/blob/master/hypershift/knowledge_base/howto/replace-pull-secret.md
 https://github.com/openshift/ops-sop/blob/master/v4/howto/transfer_cluster_ownership.md`,
 		Example: `  # Replace pull secret on a cluster
-  osdctl cluster replace-pull-secret --cluster-id 1kfmyclusterid --reason "OHSS-1234"
+  osdctl cluster pull-secret update --cluster-id 1kfmyclusterid --reason "OHSS-1234"
 
   # Dry-run to preview without making changes
-  osdctl cluster replace-pull-secret --cluster-id 1kfmyclusterid --reason "OHSS-1234" --dry-run`,
+  osdctl cluster pull-secret update --cluster-id 1kfmyclusterid --reason "OHSS-1234" --dry-run`,
 		Args:              cobra.NoArgs,
 		DisableAutoGenTag: true,
 		PreRunE: func(cmd *cobra.Command, args []string) error {
@@ -82,12 +147,14 @@ https://github.com/openshift/ops-sop/blob/master/v4/howto/transfer_cluster_owner
 	_ = cmd.MarkFlagRequired("cluster-id")
 	_ = cmd.MarkFlagRequired("reason")
 
+	cmd.SetUsageTemplate(replacePullSecUsageTemplate)
+
 	return cmd
 }
 
 func (o *replacePullSecretOptions) validate() error {
 	if !reasonPattern.MatchString(o.reason) {
-		fmt.Fprintf(o.ErrOut, "Warning: --reason %q does not appear to contain a ticket ID (e.g. OHSS-1234)\n", o.reason)
+		o.logger.Warnf("--reason %q does not appear to contain a ticket ID (e.g. OHSS-1234)", o.reason)
 		fmt.Fprint(o.Out, "Continue without a valid ticket reference? ")
 		if !utils.ConfirmPrompt() {
 			return fmt.Errorf("operation aborted — provide a valid --reason")
@@ -98,25 +165,29 @@ func (o *replacePullSecretOptions) validate() error {
 
 func (o *replacePullSecretOptions) run(ctx context.Context) error {
 	out := o.Out
-	errOut := o.ErrOut
+	logger := o.logger
 
+	log.SetLogger(zap.New(zap.WriteTo(o.ErrOut), zap.Level(zapcore.WarnLevel)))
+
+	logger.Info("Creating OCM connection")
 	ocm, err := utils.CreateConnection()
 	if err != nil {
 		return fmt.Errorf("failed to create OCM client: %w", err)
 	}
 	defer func() {
 		if closeErr := ocm.Close(); closeErr != nil {
-			fmt.Fprintf(errOut, "Cannot close the OCM connection: %v\n", closeErr)
+			logger.Warnf("Cannot close the OCM connection: %v", closeErr)
 		}
 	}()
 
-	// --- Phase 1: Identify cluster and confirm with user before expensive operations ---
+	// --- Phase 1: Identify cluster and confirm with user ---
 
 	cluster, err := utils.GetClusterAnyStatus(ocm, o.clusterID)
 	if err != nil {
 		return fmt.Errorf("failed to get cluster: %w", err)
 	}
 	o.clusterID = cluster.ID()
+	logger.Infof("Cluster resolved: %s (%s)", cluster.Name(), o.clusterID)
 
 	isHCP, err := utils.IsHostedCluster(o.clusterID)
 	if err != nil {
@@ -138,14 +209,22 @@ func (o *replacePullSecretOptions) run(ctx context.Context) error {
 		return fmt.Errorf("failed to get owner account from subscription: %w", err)
 	}
 	ownerUsername := ownerAccount.Username()
+	ownerAccountID := ownerAccount.ID()
+
+	siblingCount := controller.CountOwnerClusters(ocm, ownerAccountID, logger)
 
 	fmt.Fprintf(out, "\n============================================================\n")
 	fmt.Fprintf(out, " Cluster:  %s (%s)\n", cluster.Name(), o.clusterID)
 	fmt.Fprintf(out, " Type:     %s\n", clusterType)
-	fmt.Fprintf(out, " Owner:    %s\n", ownerUsername)
+	fmt.Fprintf(out, " Owner:    %s (account: %s)\n", ownerUsername, ownerAccountID)
 	fmt.Fprintf(out, " Reason:   %s\n", o.reason)
 	if o.dryrun {
-		fmt.Fprintf(out, " Mode:     DRY-RUN (no changes will be made)\n")
+		fmt.Fprintf(out, " Mode:     %s\n", colorDryRun("DRY-RUN (no changes will be made)"))
+	}
+	if siblingCount > 1 {
+		fmt.Fprintf(out, "\n %s This account owns %d clusters sharing the same access token.\n", colorWarn("[NOTE]"), siblingCount)
+		fmt.Fprintf(out, "          This command only updates the pull secret on the cluster above.\n")
+		fmt.Fprintf(out, "          Use 'osdctl cluster pull-secret audit -C %s' to review all clusters for this account.\n", o.clusterID)
 	}
 	fmt.Fprintf(out, "============================================================\n")
 	fmt.Fprint(out, "Is this the correct cluster? ")
@@ -159,7 +238,7 @@ func (o *replacePullSecretOptions) run(ctx context.Context) error {
 	var masterCluster *cmv1.Cluster
 
 	if isHCP {
-		fmt.Fprintln(out, "\nResolving HCP infrastructure clusters...")
+		logger.Info("Resolving HCP Management and Service clusters")
 		mgmtCluster, err = utils.GetManagementCluster(o.clusterID)
 		if err != nil {
 			return fmt.Errorf("failed to get management cluster: %w", err)
@@ -172,7 +251,7 @@ func (o *replacePullSecretOptions) run(ctx context.Context) error {
 		fmt.Fprintf(out, "  Management cluster: %s\n", mgmtCluster.Name())
 		fmt.Fprintf(out, "  Service cluster:    %s\n", svcCluster.Name())
 	} else {
-		fmt.Fprintln(out, "\nResolving Hive cluster...")
+		logger.Info("Resolving Hive cluster")
 		hiveCluster, err := utils.GetHiveCluster(o.clusterID)
 		if err != nil {
 			return fmt.Errorf("failed to get hive cluster: %w", err)
@@ -181,117 +260,113 @@ func (o *replacePullSecretOptions) run(ctx context.Context) error {
 		fmt.Fprintf(out, "  Hive cluster: %s\n", hiveCluster.Name())
 	}
 
-	elevationReasons := []string{
-		o.reason,
-		"Replacing pull secret using osdctl replace-pull-secret",
-	}
-
 	// --- Phase 3: Fetch pull secret from OCM ---
 
-	fmt.Fprintln(out, "\nFetching pull secret from OCM...")
-	pullSecret, auths, err := fetchOwnerPullSecret(ocm, ownerUsername, out)
+	logger.Infof("Fetching pull secret from OCM for owner '%s'", ownerUsername)
+	pullSecret, auths, err := controller.FetchOwnerPullSecret(ocm, ownerUsername, logger)
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(out, "  Retrieved %d auth entries from OCM access token\n", len(auths))
+	logger.Infof("Retrieved %d auth entries from OCM access token", len(auths))
 
-	// Validate that the OCM access token includes all required registries
-	var missingFromOCM []string
-	for _, required := range requiredPullSecretAuths {
-		if _, ok := auths[required]; !ok {
-			missingFromOCM = append(missingFromOCM, required)
-		}
-	}
+	missingFromOCM := controller.ValidateRequiredAuths(auths)
 	if len(missingFromOCM) > 0 {
-		fmt.Fprintf(errOut, "\nWarning: OCM access token is missing required auth entries:\n")
+		logger.Warn("OCM access token is missing required auth entries")
 		for _, m := range missingFromOCM {
-			fmt.Fprintf(errOut, "  - %s\n", m)
+			fmt.Fprintf(out, "  %s missing: %s\n", colorWarn("[WARN]"), m)
 		}
-		fmt.Fprintf(errOut, "This may indicate an issue with the cluster owner's OCM account.\n")
+		fmt.Fprintf(out, "This may indicate an issue with the cluster owner's OCM account.\n")
 		fmt.Fprint(out, "Continue with incomplete pull secret? ")
 		if !utils.ConfirmPrompt() {
 			return fmt.Errorf("aborted — OCM access token missing required registries: %v", missingFromOCM)
 		}
 	}
 
-	// --- Phase 4: Pre-flight checks ---
+	// --- Phase 4: Connect to clusters, RBAC checks, and pre-flight ---
 
-	fmt.Fprintln(out, "\nConnecting to infrastructure cluster...")
+	elevationReasons := []string{
+		o.reason,
+		"Replacing pull secret using osdctl pull-secret update",
+	}
+
+	logger.Infof("Connecting to infrastructure cluster %s (%s)", masterCluster.Name(), masterCluster.ID())
 	masterKubeCli, _, masterKubeClientSet, err := common.GetKubeConfigAndClient(masterCluster.ID(), elevationReasons...)
 	if err != nil {
 		return fmt.Errorf("failed to get kube client for infrastructure cluster %s: %w", masterCluster.ID(), err)
 	}
 
-	fmt.Fprintln(out, "Connecting to target cluster...")
+	logger.Infof("Connecting to target cluster %s (%s)", cluster.Name(), o.clusterID)
 	_, _, targetClientSet, err := common.GetKubeConfigAndClient(o.clusterID, elevationReasons...)
 	if err != nil {
 		return fmt.Errorf("failed to get kube client for target cluster %s: %w", o.clusterID, err)
 	}
 
-	if err := preflightCheck(ctx, targetClientSet, isHCP, out); err != nil {
+	if o.dryrun {
+		if err := dryRunWalkthrough(ctx, masterKubeClientSet, targetClientSet, isHCP, cluster.Name(), masterCluster.Name(), auths, out); err != nil {
+			return err
+		}
+		fmt.Fprintf(out, "\n%s Pull secret replacement pre-check completed (no changes made)\n", colorDryRun("[Dry Run]"))
+		return nil
+	}
+
+	if err := controller.PreflightCheck(ctx, targetClientSet, isHCP, cluster.Name(), out); err != nil {
 		return err
 	}
 
 	// --- Phase 5: Apply pull secret update ---
 
-	if !o.dryrun {
-		fmt.Fprint(out, "\nProceed with pull secret replacement? ")
-		if !utils.ConfirmPrompt() {
-			return fmt.Errorf("operation aborted by user")
-		}
+	fmt.Fprint(out, "\nProceed with pull secret replacement? ")
+	if !utils.ConfirmPrompt() {
+		return fmt.Errorf("operation aborted by user")
+	}
 
-		fmt.Fprintln(out, "\nApplying pull secret update...")
-		if isHCP {
-			err = updateManifestWork(ocm, masterKubeCli, o.clusterID, mgmtCluster.Name(), pullSecret)
-			if err != nil {
-				return fmt.Errorf("failed to update pull secret via ManifestWork: %w", err)
-			}
-		} else {
-			err = updatePullSecret(ocm, masterKubeCli, masterKubeClientSet, o.clusterID, pullSecret)
-			if err != nil {
-				return fmt.Errorf("failed to update pull secret via Hive SyncSet: %w", err)
-			}
-		}
-
-		if !isHCP {
-			fmt.Fprintln(out, "Rolling out telemeter-client pods...")
-			if err := rolloutPods(targetClientSet, "openshift-monitoring", "app.kubernetes.io/name=telemeter-client"); err != nil {
-				fmt.Fprintf(errOut, "Warning: failed to roll out telemeter-client pods: %v\n", err)
-			}
+	logger.Info("Applying pull secret update")
+	if isHCP {
+		err = updateManifestWork(ocm, masterKubeCli, o.clusterID, mgmtCluster.Name(), pullSecret)
+		if err != nil {
+			return fmt.Errorf("failed to update pull secret via ManifestWork: %w", err)
 		}
 	} else {
-		fmt.Fprintln(out, "\n[DRY-RUN] Would apply pull secret update — skipping")
-		if isHCP {
-			fmt.Fprintln(out, "[DRY-RUN] Would update ManifestWork on service cluster")
-		} else {
-			fmt.Fprintln(out, "[DRY-RUN] Would update pull secret via Hive SyncSet")
-			fmt.Fprintln(out, "[DRY-RUN] Would roll out telemeter-client pods")
+		err = updatePullSecret(ocm, masterKubeCli, masterKubeClientSet, o.clusterID, pullSecret)
+		if err != nil {
+			return fmt.Errorf("failed to update pull secret via Hive SyncSet: %w", err)
+		}
+	}
+
+	if !isHCP {
+		logger.Info("Rolling out pods openshift-monitoring/telemeter-client")
+		if err := rolloutPods(targetClientSet, "openshift-monitoring", "app.kubernetes.io/name=telemeter-client"); err != nil {
+			logger.Warnf("Failed to roll out pods openshift-monitoring/telemeter-client: %v", err)
 		}
 	}
 
 	// --- Phase 6: Post-operation verification ---
 
-	if !o.dryrun {
-		fmt.Fprintln(out, "\nVerifying pull secret on target cluster...")
-		if err := verifyPullSecretAuths(ctx, targetClientSet, auths, out, errOut); err != nil {
-			return fmt.Errorf("post-operation verification failed: %w", err)
-		}
-
-		if !isHCP {
-			fmt.Fprintln(out, "Rolling out ocm-agent pods...")
-			if err := rolloutPods(targetClientSet, "openshift-ocm-agent-operator", "app=ocm-agent"); err != nil {
-				fmt.Fprintf(errOut, "Warning: failed to roll out ocm-agent pods: %v\n", err)
-			}
+	logger.Infof("Verifying secret openshift-config/pull-secret on %s", cluster.Name())
+	result, err := controller.VerifyPullSecretAuths(ctx, targetClientSet, auths, out)
+	if err != nil {
+		return fmt.Errorf("post-operation verification failed: %w", err)
+	}
+	if len(result.Mismatches) > 0 {
+		fmt.Fprintf(out, "  %s %d auth(s) differ from OCM: %v\n", colorFail("[FAIL]"), len(result.Mismatches), result.Mismatches)
+		fmt.Fprint(out, "Continue despite mismatches? ")
+		if !utils.ConfirmPrompt() {
+			return fmt.Errorf("verification failed — %d auth entries did not match", len(result.Mismatches))
 		}
 	} else {
-		fmt.Fprintln(out, "\n[DRY-RUN] Would verify pull secret on target cluster — skipping")
-		if !isHCP {
-			fmt.Fprintln(out, "[DRY-RUN] Would roll out ocm-agent pods")
+		fmt.Fprintf(out, "  %s All OCM auth entries verified on target cluster\n", colorOK("[OK]"))
+	}
+
+	if !isHCP {
+		logger.Info("Rolling out pods openshift-ocm-agent-operator/ocm-agent")
+		if err := rolloutPods(targetClientSet, "openshift-ocm-agent-operator", "app=ocm-agent"); err != nil {
+			logger.Warnf("Failed to roll out pods openshift-ocm-agent-operator/ocm-agent: %v", err)
 		}
 	}
 
 	// --- Phase 7: Service log ---
 
+	logger.Info("Sending internal service log")
 	postCmd := servicelog.PostCmdOptions{
 		ClusterId: o.clusterID,
 		TemplateParams: []string{
@@ -299,174 +374,96 @@ func (o *replacePullSecretOptions) run(ctx context.Context) error {
 		},
 		InternalOnly: true,
 	}
-	postCmd.SetDryRun(o.dryrun)
 	if err := postCmd.Run(); err != nil {
-		fmt.Fprintf(errOut, "Warning: failed to send internal service log: %v\n", err)
-		fmt.Fprintf(errOut, "Please manually send: osdctl servicelog post -i %s -p MESSAGE=\"Pull secret replaced for cluster owner '%s'.\"\n", o.clusterID, ownerUsername)
+		logger.Warnf("Failed to send internal service log: %v", err)
+		fmt.Fprintf(out, "Please manually send: osdctl servicelog post -i %s -p MESSAGE=\"Pull secret replaced for cluster owner '%s'.\"\n", o.clusterID, ownerUsername)
 	}
 
-	if o.dryrun {
-		fmt.Fprintln(out, "\n[DRY-RUN] Pull secret replacement preview completed (no changes made)")
-	} else {
-		fmt.Fprintln(out, "\nPull secret replacement completed successfully")
-	}
+	fmt.Fprintf(out, "\n%s Pull secret replacement completed successfully\n", colorOK("[OK]"))
 	return nil
 }
 
-// fetchOwnerPullSecret retrieves the cluster owner's pull secret from OCM,
-// using impersonation if the current OCM user is not the cluster owner.
-// Returns the marshaled pull secret bytes and the raw auth map for verification.
-func fetchOwnerPullSecret(ocm *sdk.Connection, ownerUsername string, out io.Writer) ([]byte, map[string]*amv1.AccessTokenAuth, error) {
-	currentAccountResp, err := ocm.AccountsMgmt().V1().CurrentAccount().Get().Send()
-	if err != nil {
-		fmt.Fprintf(out, "  Warning: could not fetch current account info, will use impersonation: %v\n", err)
-	}
+// dryRunWalkthrough walks through every action the live run would perform,
+// interleaving "Would:" statements with RBAC and resource existence checks.
+func dryRunWalkthrough(ctx context.Context, infraClientSet *kubernetes.Clientset, targetClientSet *kubernetes.Clientset, isHCP bool, targetName string, infraName string, auths map[string]*amv1.AccessTokenAuth, out io.Writer) error {
+	dr := &dryRunChecker{out: out, allOK: true}
+	fmt.Fprintln(out, "")
 
-	var response *amv1.AccessTokenPostResponse
-	if currentAccountResp != nil && currentAccountResp.Body().Username() == ownerUsername {
-		fmt.Fprintln(out, "  Current OCM user matches cluster owner, fetching access token directly")
-		response, err = ocm.AccountsMgmt().V1().AccessToken().Post().Send()
+	if isHCP {
+		dr.would("update ManifestWork on service cluster %s to replace pull secret for %s", infraName, targetName)
+		dr.canI(ctx, infraClientSet, "Service cluster", "get", "manifestworks", "work.open-cluster-management.io", "")
+		dr.canI(ctx, infraClientSet, "Service cluster", "update", "manifestworks", "work.open-cluster-management.io", "")
 	} else {
-		fmt.Fprintf(out, "  Impersonating cluster owner '%s' to fetch access token\n", ownerUsername)
-		response, err = ocm.AccountsMgmt().V1().AccessToken().Post().Impersonate(ownerUsername).Parameter("body", nil).Send()
+		dr.would("replace secret in Hive namespace on %s and sync to %s via SyncSet", infraName, targetName)
+		dr.canI(ctx, infraClientSet, "Hive cluster", "list", "clusterdeployments", "hive.openshift.io", "")
+		dr.canI(ctx, infraClientSet, "Hive cluster", "delete", "secrets", "", "")
+		dr.canI(ctx, infraClientSet, "Hive cluster", "create", "secrets", "", "")
+		dr.canI(ctx, infraClientSet, "Hive cluster", "create", "syncsets", "hive.openshift.io", "")
+		dr.canI(ctx, infraClientSet, "Hive cluster", "delete", "syncsets", "hive.openshift.io", "")
 	}
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to fetch OCM access token: %w", err)
-	}
-
-	auths, ok := response.Body().GetAuths()
-	if !ok {
-		return nil, nil, fmt.Errorf("failed to get auths from access token response — contact SDB if this persists")
-	}
-
-	authsMap := map[string]map[string]string{}
-	for k, auth := range auths {
-		authsMap[k] = map[string]string{
-			"auth":  auth.Auth(),
-			"email": auth.Email(),
-		}
-	}
-
-	pullSecret, err := json.Marshal(map[string]map[string]map[string]string{
-		"auths": authsMap,
-	})
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to marshal pull secret: %w", err)
-	}
-
-	return pullSecret, auths, nil
-}
-
-// preflightCheck validates that the target cluster's pull-secret exists and is readable
-// before attempting any mutations.
-func preflightCheck(_ context.Context, clientset *kubernetes.Clientset, isHCP bool, out io.Writer) error {
-	fmt.Fprintln(out, "\nPre-flight checks...")
-
-	secret, err := clientset.CoreV1().Secrets("openshift-config").Get(context.TODO(), "pull-secret", metav1.GetOptions{})
-	if err != nil {
-		return fmt.Errorf("pre-flight: cannot read pull-secret in openshift-config: %w", err)
-	}
-
-	if _, ok := secret.Data[".dockerconfigjson"]; !ok {
-		return fmt.Errorf("pre-flight: pull-secret exists but is missing .dockerconfigjson key")
-	}
-
-	fmt.Fprintln(out, "  [OK] pull-secret exists in openshift-config")
-	fmt.Fprintln(out, "  [OK] .dockerconfigjson key present")
 
 	if !isHCP {
-		pods, err := clientset.CoreV1().Pods("openshift-monitoring").List(context.TODO(), metav1.ListOptions{
-			LabelSelector: "app.kubernetes.io/name=telemeter-client",
-		})
-		if err == nil && len(pods.Items) > 0 {
-			fmt.Fprintf(out, "  [OK] telemeter-client pods found (%d)\n", len(pods.Items))
-		} else if err != nil {
-			fmt.Fprintf(out, "  [WARN] could not list telemeter-client pods: %v\n", err)
-		}
-
-		pods, err = clientset.CoreV1().Pods("openshift-ocm-agent-operator").List(context.TODO(), metav1.ListOptions{
-			LabelSelector: "app=ocm-agent",
-		})
-		if err == nil && len(pods.Items) > 0 {
-			fmt.Fprintf(out, "  [OK] ocm-agent pods found (%d)\n", len(pods.Items))
-		} else if err != nil {
-			fmt.Fprintf(out, "  [WARN] could not list ocm-agent pods: %v\n", err)
-		}
+		dr.would("roll out pods openshift-monitoring/telemeter-client on %s", targetName)
+		dr.canI(ctx, targetClientSet, targetName, "delete", "pods", "", "openshift-monitoring")
 	}
 
-	fmt.Fprintln(out, "  Pre-flight checks passed")
+	dr.would("verify secret openshift-config/pull-secret on %s matches OCM access token", targetName)
+	dr.canI(ctx, targetClientSet, targetName, "get", "secrets", "", "openshift-config")
+
+	dr.info("Checking current state of secret openshift-config/pull-secret on %s...", targetName)
+	result, err := controller.VerifyPullSecretAuths(ctx, targetClientSet, auths, out)
+	if err != nil {
+		fmt.Fprintf(out, "  %s current pull secret state: %v\n", colorWarn("[WARN]"), err)
+	} else if result.Matched == result.Total {
+		fmt.Fprintf(out, "  %s Pull secret is already up to date — a live run would be a no-op\n", colorOK("[INFO]"))
+	}
+
+	if !isHCP {
+		dr.would("roll out pods openshift-ocm-agent-operator/ocm-agent on %s", targetName)
+		dr.canI(ctx, targetClientSet, targetName, "delete", "pods", "", "openshift-ocm-agent-operator")
+	}
+
+	dr.would("send internal service log for %s", targetName)
+
+	if !dr.allOK {
+		fmt.Fprintf(out, "\n%s %s Some checks failed. Verify elevated permissions before running without --dry-run.\n", colorDryRun("[Dry Run]"), colorFail("[FAIL]"))
+	} else {
+		fmt.Fprintf(out, "\n%s %s All pre-flight checks passed. No changes were made.\n", colorDryRun("[Dry Run]"), colorOK("OK"))
+	}
+
 	return nil
 }
 
-// verifyPullSecretAuths programmatically compares the OCM access token auths
-// against the pull secret deployed on the target cluster. This replaces the
-// manual "does this look right?" prompt from verifyClusterPullSecret().
-func verifyPullSecretAuths(_ context.Context, clientset *kubernetes.Clientset, expectedAuths map[string]*amv1.AccessTokenAuth, out io.Writer, errOut io.Writer) error {
-	pullSecret, err := clientset.CoreV1().Secrets("openshift-config").Get(context.TODO(), "pull-secret", metav1.GetOptions{})
+// canI checks RBAC permission and reports it in dry-run format with system label.
+func (d *dryRunChecker) canI(ctx context.Context, clientset *kubernetes.Clientset, systemLabel, verb, resource, group, namespace string) {
+	allowed, err := checkCanI(ctx, clientset, verb, resource, group, namespace)
+	nsLabel := namespace
+	if nsLabel == "" {
+		nsLabel = "(cluster-scoped)"
+	}
 	if err != nil {
-		return fmt.Errorf("failed to get pull-secret from target cluster: %w", err)
-	}
-
-	if _, ok := pullSecret.Data[".dockerconfigjson"]; !ok {
-		return fmt.Errorf("pull-secret is missing .dockerconfigjson key after update")
-	}
-
-	// Use the existing getPullSecretTokenAuth from validatepullsecretext.go
-	// to extract and compare each auth entry
-	var mismatches []string
-	matched := 0
-	for authKey, expectedAuth := range expectedAuths {
-		clusterAuth, err := getPullSecretTokenAuth(authKey, pullSecret)
-		if err != nil {
-			mismatches = append(mismatches, fmt.Sprintf("  %s: not found in cluster secret (%v)", authKey, err))
-			continue
-		}
-
-		if clusterAuth.Auth() != expectedAuth.Auth() {
-			mismatches = append(mismatches, fmt.Sprintf("  %s: auth token mismatch", authKey))
-			continue
-		}
-
-		if clusterAuth.Email() != expectedAuth.Email() {
-			mismatches = append(mismatches, fmt.Sprintf("  %s: email mismatch (cluster=%q, expected=%q)", authKey, clusterAuth.Email(), expectedAuth.Email()))
-			continue
-		}
-
-		matched++
-	}
-
-	fmt.Fprintf(out, "  Verified %d/%d auth entries match\n", matched, len(expectedAuths))
-
-	if len(mismatches) > 0 {
-		fmt.Fprintf(errOut, "\nVerification found %d mismatch(es):\n", len(mismatches))
-		for _, m := range mismatches {
-			fmt.Fprintln(errOut, m)
-		}
-		fmt.Fprint(out, "Continue despite mismatches? ")
-		if !utils.ConfirmPrompt() {
-			return fmt.Errorf("verification failed — %d auth entries did not match", len(mismatches))
-		}
+		fmt.Fprintf(d.out, "%s %s %s: auth can-i %s %s in %s (%v)\n",
+			colorDryRun("[Dry Run]"), colorWarn("[SKIP]"), systemLabel, verb, resource, nsLabel, err)
 	} else {
-		fmt.Fprintln(out, "  [OK] All OCM auth entries verified on target cluster")
+		d.report(allowed, "%s: auth can-i %s %s in %s", systemLabel, verb, resource, nsLabel)
 	}
+}
 
-	// Validate that required registries are present in the cluster's pull secret
-	var missingRequired []string
-	for _, required := range requiredPullSecretAuths {
-		_, err := getPullSecretTokenAuth(required, pullSecret)
-		if err != nil {
-			missingRequired = append(missingRequired, required)
-		}
+// checkCanI performs a SelfSubjectAccessReview to verify RBAC permission.
+func checkCanI(ctx context.Context, clientset *kubernetes.Clientset, verb, resource, group, namespace string) (bool, error) {
+	review := &authorizationv1.SelfSubjectAccessReview{
+		Spec: authorizationv1.SelfSubjectAccessReviewSpec{
+			ResourceAttributes: &authorizationv1.ResourceAttributes{
+				Verb:      verb,
+				Resource:  resource,
+				Group:     group,
+				Namespace: namespace,
+			},
+		},
 	}
-	if len(missingRequired) > 0 {
-		fmt.Fprintf(errOut, "\nWarning: cluster pull secret is missing required registries:\n")
-		for _, m := range missingRequired {
-			fmt.Fprintf(errOut, "  - %s\n", m)
-		}
-		fmt.Fprintf(errOut, "The cluster may have issues pulling images or reporting telemetry.\n")
-	} else {
-		fmt.Fprintln(out, "  [OK] All required registries present in cluster pull secret")
+	result, err := clientset.AuthorizationV1().SelfSubjectAccessReviews().Create(ctx, review, metav1.CreateOptions{})
+	if err != nil {
+		return false, err
 	}
-
-	return nil
+	return result.Status.Allowed, nil
 }
