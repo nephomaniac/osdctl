@@ -190,7 +190,7 @@ func (o *pullSecretSnapshotOptions) run(ctx context.Context) error {
 	if len(checkIDs) > 0 {
 		// Try access token first — may fail without region-lead permissions
 		logger.Infof("Fetching access token from OCM for owner '%s'", ownerUsername)
-		_, auths, err = controller.FetchOwnerPullSecret(ocm, ownerUsername, logger)
+		_, auths, err = controller.FetchOwnerAccessToken(ocm, ownerUsername, logger)
 		if err != nil {
 			logger.Warnf("Could not fetch access token: %v", err)
 			fmt.Fprintf(out, "\n%s Could not fetch OCM access token (may require region-lead permissions).\n", colorWarn("[WARN]"))
@@ -242,7 +242,7 @@ func (o *pullSecretSnapshotOptions) run(ctx context.Context) error {
 			}
 
 			if hasAccessToken {
-				result, verifyErr := controller.VerifyPullSecretAuths(ctx, clientset, auths, nil)
+				result, verifyErr := controller.CompareAccessTokenAuthsToCluster(ctx, clientset, auths, nil)
 				if verifyErr != nil {
 					logger.Warnf("Access token verification failed for %s: %v", clusterID, verifyErr)
 				} else {
@@ -251,7 +251,7 @@ func (o *pullSecretSnapshotOptions) run(ctx context.Context) error {
 			}
 
 			if hasRegCreds {
-				result, verifyErr := controller.VerifyRegistryCredentials(ctx, ocm, clientset, ownerAccountID, ownerAccount.Email(), nil)
+				result, verifyErr := controller.CompareRegistryCredentialAuthsToCluster(ctx, ocm, clientset, ownerAccountID, ownerAccount.Email(), nil)
 				if verifyErr != nil {
 					logger.Warnf("Registry credential verification failed for %s: %v", clusterID, verifyErr)
 				} else {

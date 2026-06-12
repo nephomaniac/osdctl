@@ -14,7 +14,6 @@ import (
 	cmv1 "github.com/openshift-online/ocm-sdk-go/clustersmgmt/v1"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
 	"k8s.io/client-go/kubernetes"
@@ -552,7 +551,7 @@ func (o *replacePullSecretOptions) run(ctx context.Context) error {
 		}
 
 		if !o.dryrun && op.AllOK {
-			err = updateManifestWork(ocm, masterKubeCli, o.clusterID, mgmtCluster.Name(), pullSecret)
+			err = controller.UpdateHCPPullSecretViaManifestWork(ctx, ocm, masterKubeCli, o.clusterID, mgmtCluster.Name(), pullSecret, out)
 			if err != nil {
 				return fmt.Errorf("failed to update pull secret via ManifestWork: %w", err)
 			}
@@ -616,7 +615,7 @@ func (o *replacePullSecretOptions) run(ctx context.Context) error {
 		if !o.dryrun && op.AllOK && resolvedHiveNS != "" {
 			// Use the resolved namespace instead of letting updatePullSecret re-discover it
 			op.Info("Updating pull secret in %s/pull on %s", resolvedHiveNS, infraName)
-			err = updatePullSecretInNamespace(masterKubeCli, masterKubeClientSet, resolvedHiveNS, resolvedCDName, pullSecret)
+			err = controller.UpdateHivePullSecretSSS(ctx, masterKubeCli, masterKubeClientSet, resolvedHiveNS, resolvedCDName, pullSecret, out)
 			if err != nil {
 				return fmt.Errorf("failed to update pull secret via Hive SyncSet: %w", err)
 			}
@@ -647,7 +646,7 @@ func (o *replacePullSecretOptions) run(ctx context.Context) error {
 
 		if !o.dryrun && op.AllOK {
 			logger.Info("Rolling out pods openshift-monitoring/telemeter-client")
-			if err := rolloutPods(targetClientSet, "openshift-monitoring", "app.kubernetes.io/name=telemeter-client"); err != nil {
+			if err := controller.RestartPodsBySelector(ctx, targetClientSet, "openshift-monitoring", "app.kubernetes.io/name=telemeter-client", out); err != nil {
 				op.Warn("failed to roll out telemeter-client pods: %v", err)
 			}
 		}
@@ -672,7 +671,7 @@ func (o *replacePullSecretOptions) run(ctx context.Context) error {
 		atLabel := color.New(color.FgBlue, color.Bold).SprintFunc()
 		if auths != nil {
 			op.Info("Comparing %s against openshift-config/pull-secret on %s...", atLabel("ACCESS TOKEN"), cluster.Name())
-			atResult, verifyErr := controller.VerifyPullSecretAuths(ctx, targetClientSet, auths, out)
+			atResult, verifyErr := controller.CompareAccessTokenAuthsToCluster(ctx, targetClientSet, auths, out)
 			if verifyErr != nil {
 				op.Warn("%s verification: %v", atLabel("ACCESS TOKEN"), verifyErr)
 			} else if atResult.Matched == atResult.Total {
@@ -690,7 +689,7 @@ func (o *replacePullSecretOptions) run(ctx context.Context) error {
 		// Registry credential verification
 		rcLabel := color.New(color.FgBlue, color.Bold).SprintFunc()
 		op.Info("Comparing %s against openshift-config/pull-secret on %s...", rcLabel("REGISTRY CREDENTIAL"), cluster.Name())
-		rcResult, rcErr := controller.VerifyRegistryCredentials(ctx, ocm, targetClientSet, ownerAccountID, ownerAccount.Email(), out)
+		rcResult, rcErr := controller.CompareRegistryCredentialAuthsToCluster(ctx, ocm, targetClientSet, ownerAccountID, ownerAccount.Email(), out)
 		if rcErr != nil {
 			op.Warn("%s verification: %v", rcLabel("REGISTRY CREDENTIAL"), rcErr)
 		} else if rcResult.Matched == rcResult.Total {
@@ -718,7 +717,7 @@ func (o *replacePullSecretOptions) run(ctx context.Context) error {
 
 	if !isHCP && !o.dryrun && op.AllOK {
 		logger.Info("Rolling out pods openshift-ocm-agent-operator/ocm-agent")
-		if err := rolloutPods(targetClientSet, "openshift-ocm-agent-operator", "app=ocm-agent"); err != nil {
+		if err := controller.RestartPodsBySelector(ctx, targetClientSet, "openshift-ocm-agent-operator", "app=ocm-agent", out); err != nil {
 			op.Warn("failed to roll out ocm-agent pods: %v", err)
 		}
 	}
@@ -845,47 +844,3 @@ func (o *replacePullSecretOptions) run(ctx context.Context) error {
 	return nil
 }
 
-// updatePullSecretInNamespace updates the pull secret in the given hive namespace
-// using update-in-place (never deletes). If the secret doesn't exist, it creates it.
-// When the secret exists, new auths are merged into the existing secret via buildNewSecret,
-// preserving any auths not present in the new data (e.g. customer-added registries).
-// This avoids the race condition window in the original delete+create approach used
-// by transfer-owner (transferowner.go:updatePullSecret).
-func updatePullSecretInNamespace(kubeCli client.Client, clientset *kubernetes.Clientset, hiveNamespace string, cdName string, pullsecret []byte) error {
-	secretName := "pull"
-	ctx := context.TODO()
-
-	existing, err := clientset.CoreV1().Secrets(hiveNamespace).Get(ctx, secretName, metav1.GetOptions{})
-	if err != nil {
-		secret := &corev1.Secret{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      secretName,
-				Namespace: hiveNamespace,
-			},
-			Type: corev1.SecretTypeDockerConfigJson,
-			Data: map[string][]byte{
-				".dockerconfigjson": pullsecret,
-			},
-		}
-		_, createErr := clientset.CoreV1().Secrets(hiveNamespace).Create(ctx, secret, metav1.CreateOptions{})
-		if createErr != nil {
-			return fmt.Errorf("failed to create secret %s/%s: %w", hiveNamespace, secretName, createErr)
-		}
-	} else {
-		mergedData, mergeErr := buildNewSecret(existing.Data[".dockerconfigjson"], pullsecret)
-		if mergeErr != nil {
-			return fmt.Errorf("failed to merge pull secret auths for %s/%s: %w", hiveNamespace, secretName, mergeErr)
-		}
-		existing.Data[".dockerconfigjson"] = mergedData
-		_, updateErr := clientset.CoreV1().Secrets(hiveNamespace).Update(ctx, existing, metav1.UpdateOptions{})
-		if updateErr != nil {
-			return fmt.Errorf("failed to update secret %s/%s: %w", hiveNamespace, secretName, updateErr)
-		}
-	}
-
-	if err := awaitPullSecretSyncSet(hiveNamespace, cdName, kubeCli); err != nil {
-		return fmt.Errorf("failed to synchronize pull secret for namespace '%s': %w", hiveNamespace, err)
-	}
-
-	return nil
-}

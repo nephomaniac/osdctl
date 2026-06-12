@@ -178,10 +178,10 @@ func (op *PullSecretOp) FindHiveNamespaceOp(ctx context.Context, kubeCli client.
 	return hiveInfo, true
 }
 
-// FetchAccessTokenOp wraps FetchOwnerPullSecret with operational output.
+// FetchAccessTokenOp wraps FetchOwnerAccessToken with operational output.
 func (op *PullSecretOp) FetchAccessTokenOp(ocm *sdk.Connection, ownerUsername string) ([]byte, map[string]*amv1.AccessTokenAuth, bool) {
 	op.Logger.Infof("Fetching pull secret from OCM for owner '%s'", ownerUsername)
-	pullSecret, auths, err := FetchOwnerPullSecret(ocm, ownerUsername, op.Logger)
+	pullSecret, auths, err := FetchOwnerAccessToken(ocm, ownerUsername, op.Logger)
 	if err != nil {
 		op.Fail("could not fetch OCM access token: %v", err)
 		return nil, nil, false

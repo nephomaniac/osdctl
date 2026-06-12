@@ -13,10 +13,17 @@ import (
 	sdk "github.com/openshift-online/ocm-sdk-go"
 	amv1 "github.com/openshift-online/ocm-sdk-go/accountsmgmt/v1"
 	hiveapiv1 "github.com/openshift/hive/apis/hive/v1"
+	hiveinternalv1alpha1 "github.com/openshift/hive/apis/hiveinternal/v1alpha1"
+	hypershiftv1beta1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
 	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/util/retry"
+	"math/rand"
+	"strings"
+	workv1 "open-cluster-management.io/api/work/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/openshift/osdctl/pkg/utils"
@@ -65,10 +72,10 @@ type PullSecretVerifyResult struct {
 	MissingRequired []string
 }
 
-// FetchOwnerPullSecret retrieves the cluster owner's pull secret from OCM,
+// FetchOwnerAccessToken retrieves the cluster owner's pull secret from OCM,
 // using impersonation if the current OCM user is not the cluster owner.
 // Returns the marshaled pull secret bytes and the raw auth map for verification.
-func FetchOwnerPullSecret(ocm *sdk.Connection, ownerUsername string, logger *logrus.Logger) ([]byte, map[string]*amv1.AccessTokenAuth, error) {
+func FetchOwnerAccessToken(ocm *sdk.Connection, ownerUsername string, logger *logrus.Logger) ([]byte, map[string]*amv1.AccessTokenAuth, error) {
 	currentAccountResp, err := ocm.AccountsMgmt().V1().CurrentAccount().Get().Send()
 	if err != nil {
 		logger.Warnf("Could not fetch current account info, will use impersonation: %v", err)
@@ -121,10 +128,10 @@ func ValidateRequiredAuths(auths map[string]*amv1.AccessTokenAuth) []string {
 	return missing
 }
 
-// VerifyPullSecretAuths compares OCM access token auths against the pull
+// CompareAccessTokenAuthsToCluster compares OCM access token auths against the pull
 // secret on the target cluster. Writes per-registry results to out.
 // Returns a PullSecretVerifyResult with match counts and any mismatches.
-func VerifyPullSecretAuths(ctx context.Context, clientset *kubernetes.Clientset, expectedAuths map[string]*amv1.AccessTokenAuth, out io.Writer) (*PullSecretVerifyResult, error) {
+func CompareAccessTokenAuthsToCluster(ctx context.Context, clientset *kubernetes.Clientset, expectedAuths map[string]*amv1.AccessTokenAuth, out io.Writer) (*PullSecretVerifyResult, error) {
 	pullSecret, err := clientset.CoreV1().Secrets("openshift-config").Get(ctx, "pull-secret", metav1.GetOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to get secret openshift-config/pull-secret from target cluster: %w", err)
@@ -211,10 +218,10 @@ func RenderVerifyResult(result *PullSecretVerifyResult, out io.Writer) {
 	}
 }
 
-// VerifyRegistryCredentials compares OCM registry credentials against the pull
+// CompareRegistryCredentialAuthsToCluster compares OCM registry credentials against the pull
 // secret on the target cluster. Registry credentials use a different token
 // format (base64-encoded "username:token") than access token auths.
-func VerifyRegistryCredentials(ctx context.Context, ocm *sdk.Connection, clientset *kubernetes.Clientset, accountID string, accountEmail string, out io.Writer) (*PullSecretVerifyResult, error) {
+func CompareRegistryCredentialAuthsToCluster(ctx context.Context, ocm *sdk.Connection, clientset *kubernetes.Clientset, accountID string, accountEmail string, out io.Writer) (*PullSecretVerifyResult, error) {
 	creds, err := utils.GetRegistryCredentials(ocm, accountID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch registry credentials: %w", err)
@@ -819,4 +826,288 @@ func BuildPullSecretFromSources(
 	}
 
 	return result, pullSecret, nil
+}
+
+const (
+	checkSyncMaxAttempts = 24
+	syncPollInterval     = 5 * time.Second
+)
+
+// MergePullSecretAuths merges new auths into existing pull secret data. Existing auths
+// not present in newData are preserved. This never removes auths.
+func MergePullSecretAuths(existingData, newData []byte) ([]byte, error) {
+	type auth struct {
+		Auth  string `json:"auth"`
+		Email string `json:"email"`
+	}
+	type auths struct {
+		Auths map[string]auth `json:"auths"`
+	}
+
+	var existing, incoming auths
+
+	if err := json.Unmarshal(existingData, &existing); err != nil {
+		return nil, fmt.Errorf("failed to parse existing pull secret: %w", err)
+	}
+	if err := json.Unmarshal(newData, &incoming); err != nil {
+		return nil, fmt.Errorf("failed to parse new pull secret: %w", err)
+	}
+
+	for k, v := range incoming.Auths {
+		existing.Auths[k] = v
+	}
+
+	return json.Marshal(existing)
+}
+
+// UpdateHivePullSecretSSS updates the pull secret in the given hive namespace
+// using update-in-place (never deletes). If the secret doesn't exist, it creates it.
+// When the secret exists, new auths are merged into the existing secret via MergePullSecretAuths,
+// preserving any auths not present in the new data.
+func UpdateHivePullSecretSSS(ctx context.Context, kubeCli client.Client, clientset *kubernetes.Clientset, hiveNamespace string, cdName string, pullsecret []byte, out io.Writer) error {
+	secretName := "pull"
+
+	existing, err := clientset.CoreV1().Secrets(hiveNamespace).Get(ctx, secretName, metav1.GetOptions{})
+	if err != nil {
+		secret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      secretName,
+				Namespace: hiveNamespace,
+			},
+			Type: corev1.SecretTypeDockerConfigJson,
+			Data: map[string][]byte{
+				".dockerconfigjson": pullsecret,
+			},
+		}
+		_, createErr := clientset.CoreV1().Secrets(hiveNamespace).Create(ctx, secret, metav1.CreateOptions{})
+		if createErr != nil {
+			return fmt.Errorf("failed to create secret %s/%s: %w", hiveNamespace, secretName, createErr)
+		}
+	} else {
+		mergedData, mergeErr := MergePullSecretAuths(existing.Data[".dockerconfigjson"], pullsecret)
+		if mergeErr != nil {
+			return fmt.Errorf("failed to merge pull secret auths for %s/%s: %w", hiveNamespace, secretName, mergeErr)
+		}
+		existing.Data[".dockerconfigjson"] = mergedData
+		_, updateErr := clientset.CoreV1().Secrets(hiveNamespace).Update(ctx, existing, metav1.UpdateOptions{})
+		if updateErr != nil {
+			return fmt.Errorf("failed to update secret %s/%s: %w", hiveNamespace, secretName, updateErr)
+		}
+	}
+
+	if err := syncPullSecretViaHive(ctx, hiveNamespace, cdName, kubeCli, out); err != nil {
+		return fmt.Errorf("failed to synchronize pull secret for namespace '%s': %w", hiveNamespace, err)
+	}
+
+	return nil
+}
+
+// syncPullSecretViaHive creates a SyncSet to sync the pull secret from hive to
+// the target cluster, polls ClusterSync for completion, then cleans up the SyncSet.
+func syncPullSecretViaHive(ctx context.Context, hiveNamespace string, cdName string, kubeCli client.Client, out io.Writer) error {
+	syncSet := &hiveapiv1.SyncSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pull-secret-replacement",
+			Namespace: hiveNamespace,
+		},
+		Spec: hiveapiv1.SyncSetSpec{
+			ClusterDeploymentRefs: []corev1.LocalObjectReference{
+				{Name: cdName},
+			},
+			SyncSetCommonSpec: hiveapiv1.SyncSetCommonSpec{
+				ResourceApplyMode: "Upsert",
+				Secrets: []hiveapiv1.SecretMapping{
+					{
+						SourceRef: hiveapiv1.SecretReference{
+							Name:      "pull",
+							Namespace: hiveNamespace,
+						},
+						TargetRef: hiveapiv1.SecretReference{
+							Name:      "pull-secret",
+							Namespace: "openshift-config",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	if err := kubeCli.Create(ctx, syncSet); err != nil {
+		return fmt.Errorf("failed to create SyncSet: %w", err)
+	}
+	fmt.Fprintf(out, "SyncSet pull-secret-replacement in namespace %s has been created.\n", hiveNamespace)
+
+	if err := hiveinternalv1alpha1.AddToScheme(kubeCli.Scheme()); err != nil {
+		return fmt.Errorf("failed to add hiveinternal scheme: %w", err)
+	}
+
+	searchStatus := &hiveinternalv1alpha1.ClusterSync{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      cdName,
+			Namespace: hiveNamespace,
+		},
+	}
+	foundStatus := &hiveinternalv1alpha1.ClusterSync{}
+	isSynced := false
+	for i := 0; i < checkSyncMaxAttempts; i++ {
+		if err := kubeCli.Get(ctx, client.ObjectKeyFromObject(searchStatus), foundStatus); err != nil {
+			return fmt.Errorf("failed to get ClusterSync status for %s: %w", cdName, err)
+		}
+
+		for _, status := range foundStatus.Status.SyncSets {
+			if status.Name == "pull-secret-replacement" && status.FirstSuccessTime != nil {
+				isSynced = true
+				break
+			}
+		}
+
+		if isSynced {
+			fmt.Fprintf(out, "\nSync completed...\n")
+			break
+		}
+
+		fmt.Fprintf(out, ".")
+		time.Sleep(syncPollInterval)
+	}
+	if !isSynced {
+		return fmt.Errorf("SyncSet %s/pull-secret-replacement failed to sync after %d attempts", hiveNamespace, checkSyncMaxAttempts)
+	}
+
+	if err := kubeCli.Delete(ctx, syncSet); err != nil {
+		return fmt.Errorf("failed to delete SyncSet %s/pull-secret-replacement: %w", hiveNamespace, err)
+	}
+
+	return nil
+}
+
+// UpdateHCPPullSecretViaManifestWork updates the pull secret within a ManifestWork
+// on the service cluster for HCP clusters.
+//
+// HCP pull secret architecture:
+//   - This operates at level 1 (HostedCluster.spec.pullSecret)
+//   - HCCO reconciles changes to kube-system/original-pull-secret on the hosted cluster
+//   - Customer-added registries in kube-system/additional-pull-secret are not affected
+//   - Ref: https://access.redhat.com/solutions/7118834
+//   - Ref: https://hypershift.pages.dev/how-to/powervs/global-pull-secret/
+func UpdateHCPPullSecretViaManifestWork(ctx context.Context, ocm *sdk.Connection, kubeCli client.Client, clusterID, mgmtClusterName string, pullsecret []byte, out io.Writer) error {
+	if err := workv1.AddToScheme(kubeCli.Scheme()); err != nil {
+		return fmt.Errorf("failed to add work scheme: %w", err)
+	}
+
+	hostedCluster, err := utils.GetClusterAnyStatus(ocm, clusterID)
+	if err != nil {
+		return fmt.Errorf("failed to get cluster: %w", err)
+	}
+
+	secretNamePrefix := hostedCluster.DomainPrefix() + "-pull"
+	newSecretName := secretNamePrefix + "-" + randomHexSuffix(6)
+
+	timeoutCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+
+	err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		manifestWork := &workv1.ManifestWork{}
+		if err := kubeCli.Get(timeoutCtx, types.NamespacedName{Name: clusterID, Namespace: mgmtClusterName}, manifestWork); err != nil {
+			return fmt.Errorf("failed to get ManifestWork %s/%s: %w", mgmtClusterName, clusterID, err)
+		}
+
+		if err := updateManifestWorkPayloads(manifestWork, secretNamePrefix, newSecretName, pullsecret); err != nil {
+			return err
+		}
+
+		return kubeCli.Update(timeoutCtx, manifestWork, &client.UpdateOptions{})
+	})
+	if err != nil {
+		return fmt.Errorf("cannot update pull-secret within ManifestWork: %w", err)
+	}
+
+	fmt.Fprintf(out, "ManifestWork updated. Waiting 60 seconds for secret to sync on hosted cluster...\n")
+	select {
+	case <-timeoutCtx.Done():
+		return fmt.Errorf("context cancelled while waiting for secret sync: %w", timeoutCtx.Err())
+	case <-time.After(60 * time.Second):
+	}
+
+	return nil
+}
+
+func updateManifestWorkPayloads(mw *workv1.ManifestWork, secretNamePrefix, newSecretName string, pullsecret []byte) error {
+	for i, manifest := range mw.Spec.Workload.Manifests {
+		if manifest.Raw == nil {
+			continue
+		}
+
+		var meta struct {
+			Kind string `json:"kind"`
+		}
+		if err := json.Unmarshal(manifest.Raw, &meta); err != nil {
+			return err
+		}
+
+		switch meta.Kind {
+		case "Secret":
+			secret := &corev1.Secret{}
+			if err := json.Unmarshal(manifest.Raw, secret); err != nil {
+				return err
+			}
+			if strings.Contains(secret.Name, secretNamePrefix) {
+				if secret.Data == nil {
+					secret.Data = map[string][]byte{}
+				}
+				oldPullSecret := secret.Data[".dockerconfigjson"]
+				newPullSecret, err := MergePullSecretAuths(oldPullSecret, pullsecret)
+				if err != nil {
+					return fmt.Errorf("cannot merge pull secret auths: %w", err)
+				}
+				secret.Name = newSecretName
+				secret.Data[".dockerconfigjson"] = newPullSecret
+				secretJSON, err := json.Marshal(secret)
+				if err != nil {
+					return err
+				}
+				mw.Spec.Workload.Manifests[i].Raw = secretJSON
+			}
+		case "HostedCluster":
+			hc := &hypershiftv1beta1.HostedCluster{}
+			if err := json.Unmarshal(manifest.Raw, hc); err != nil {
+				return err
+			}
+			hc.Spec.PullSecret.Name = newSecretName
+			hcJSON, err := json.Marshal(hc)
+			if err != nil {
+				return err
+			}
+			mw.Spec.Workload.Manifests[i].Raw = hcJSON
+		}
+	}
+	return nil
+}
+
+// RestartPodsBySelector deletes pods matching the selector in the namespace to trigger a rollout.
+func RestartPodsBySelector(ctx context.Context, clientset *kubernetes.Clientset, namespace, selector string, out io.Writer) error {
+	pods, err := clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: selector,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to list pods in namespace '%s' with selector '%s': %w", namespace, selector, err)
+	}
+
+	for _, pod := range pods.Items {
+		if err := clientset.CoreV1().Pods(namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{}); err != nil {
+			return fmt.Errorf("failed to delete pod '%s' in namespace '%s': %w", pod.Name, namespace, err)
+		}
+		fmt.Fprintf(out, "Pod %s in namespace %s has been deleted.\n", pod.Name, namespace)
+	}
+
+	fmt.Fprintf(out, "Pods in namespace %s with selector '%s' have been deleted.\n", namespace, selector)
+	return nil
+}
+
+func randomHexSuffix(length int) string {
+	const chars = "0123456789abcdef"
+	result := make([]byte, length)
+	for i := range result {
+		result[i] = chars[rand.Intn(len(chars))]
+	}
+	return string(result)
 }
