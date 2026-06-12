@@ -11,10 +11,12 @@ import (
 	"github.com/fatih/color"
 	sdk "github.com/openshift-online/ocm-sdk-go"
 	amv1 "github.com/openshift-online/ocm-sdk-go/accountsmgmt/v1"
+	hiveapiv1 "github.com/openshift/hive/apis/hive/v1"
 	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/openshift/osdctl/pkg/utils"
 )
@@ -304,19 +306,77 @@ func VerifyRegistryCredentials(ctx context.Context, ocm *sdk.Connection, clients
 	return result, nil
 }
 
+// HiveNamespaceInfo holds the resolved Hive namespace and ClusterDeployment name
+// for a given cluster.
+type HiveNamespaceInfo struct {
+	Namespace           string
+	ClusterDeploymentName string
+}
+
+// FindHiveNamespace discovers the Hive namespace for a cluster by listing
+// ClusterDeployments filtered by the api.openshift.com/id label. This avoids
+// the fragile uhc-{env}-{clusterID} namespace construction.
+func FindHiveNamespace(ctx context.Context, kubeCli client.Client, clusterID string) (*HiveNamespaceInfo, error) {
+	if err := hiveapiv1.AddToScheme(kubeCli.Scheme()); err != nil {
+		return nil, fmt.Errorf("failed to add hive scheme: %w", err)
+	}
+
+	// Try label-based lookup first (fast, targeted)
+	cdList := &hiveapiv1.ClusterDeploymentList{}
+	labelSelector := client.MatchingLabels{"api.openshift.com/id": clusterID}
+	if err := kubeCli.List(ctx, cdList, labelSelector); err == nil && len(cdList.Items) > 0 {
+		cd := cdList.Items[0]
+		return &HiveNamespaceInfo{
+			Namespace:             cd.Namespace,
+			ClusterDeploymentName: cd.Name,
+		}, nil
+	}
+
+	// Fallback: list all ClusterDeployments and match by ClusterMetadata
+	allCDs := &hiveapiv1.ClusterDeploymentList{}
+	if err := kubeCli.List(ctx, allCDs); err != nil {
+		return nil, fmt.Errorf("failed to list ClusterDeployments: %w", err)
+	}
+
+	for _, cd := range allCDs.Items {
+		if cd.Spec.ClusterMetadata != nil && cd.Spec.ClusterMetadata.ClusterID == clusterID {
+			return &HiveNamespaceInfo{
+				Namespace:             cd.Namespace,
+				ClusterDeploymentName: cd.Name,
+			}, nil
+		}
+	}
+
+	return nil, fmt.Errorf("no ClusterDeployment found for cluster ID %s", clusterID)
+}
+
+// PreflightResult holds the outcome of pre-flight checks.
+type PreflightResult struct {
+	SecretExists bool
+	SecretData   []byte // existing .dockerconfigjson content, nil if missing
+}
+
 // PreflightCheck validates that the target cluster's pull-secret exists and is
 // readable before attempting any mutations. All operations are read-only.
-func PreflightCheck(ctx context.Context, clientset *kubernetes.Clientset, isHCP bool, clusterName string, out io.Writer) error {
+// Returns a PreflightResult so callers can decide whether to create or update.
+func PreflightCheck(ctx context.Context, clientset *kubernetes.Clientset, isHCP bool, clusterName string, out io.Writer) (*PreflightResult, error) {
 	fmt.Fprintf(out, "\nPre-flight checks on %s...\n", clusterName)
+	result := &PreflightResult{}
 
 	secret, err := clientset.CoreV1().Secrets("openshift-config").Get(ctx, "pull-secret", metav1.GetOptions{})
 	if err != nil {
-		return fmt.Errorf("pre-flight: cannot read secret openshift-config/pull-secret on %s: %w", clusterName, err)
+		fmt.Fprintf(out, "  %s secret openshift-config/pull-secret not found on %s\n", psColorWarn("[WARN]"), clusterName)
+		fmt.Fprintf(out, "  The pull secret can be rebuilt from the owner's OCM access token and registry credentials.\n")
+		return result, nil
 	}
+	result.SecretExists = true
 
-	if _, ok := secret.Data[".dockerconfigjson"]; !ok {
-		return fmt.Errorf("pre-flight: secret openshift-config/pull-secret on %s exists but is missing .dockerconfigjson key", clusterName)
+	data, ok := secret.Data[".dockerconfigjson"]
+	if !ok {
+		fmt.Fprintf(out, "  %s secret openshift-config/pull-secret exists on %s but is missing .dockerconfigjson key\n", psColorWarn("[WARN]"), clusterName)
+		return result, nil
 	}
+	result.SecretData = data
 
 	fmt.Fprintf(out, "  %s secret openshift-config/pull-secret exists on %s\n", psColorOK("[OK]"), clusterName)
 	fmt.Fprintf(out, "  %s secret openshift-config/pull-secret has .dockerconfigjson key\n", psColorOK("[OK]"))
@@ -342,7 +402,7 @@ func PreflightCheck(ctx context.Context, clientset *kubernetes.Clientset, isHCP 
 	}
 
 	fmt.Fprintf(out, "  %s Pre-flight checks passed\n", psColorOK("[OK]"))
-	return nil
+	return result, nil
 }
 
 // CountOwnerClusters returns the number of active clusters owned by the given
@@ -444,4 +504,153 @@ func extractPullSecretAuth(authID string, secret *corev1.Secret) (*pullSecretAut
 		auth:  entry.Auth,
 		email: entry.Email,
 	}, nil
+}
+
+// AuthSource indicates where a pull secret auth entry came from.
+type AuthSource string
+
+const (
+	SourceAccessToken      AuthSource = "access_token"
+	SourceRegistryCredential AuthSource = "registry_credential"
+	SourceExisting         AuthSource = "existing"
+)
+
+// MergedAuth represents a single registry auth entry with its source and merge status.
+type MergedAuth struct {
+	Registry string
+	Auth     string
+	Email    string
+	Source   AuthSource
+}
+
+// AuthConflict represents a registry where access token and registry credential provide different values.
+type AuthConflict struct {
+	Registry       string
+	AccessTokenAuth string
+	RegCredAuth    string
+}
+
+// MergeResult holds the outcome of merging auth sources.
+type MergeResult struct {
+	Auths     map[string]MergedAuth
+	Conflicts []AuthConflict
+	Added     []string // registries added from registry credentials
+}
+
+// BuildPullSecretFromSources merges access token auths and registry credential
+// auths into a single pull secret, respecting the priority model:
+// 1. Access token auths are always applied (primary source)
+// 2. Registry credential auths fill in registries not covered by the access token
+// 3. Conflicts (same registry, different values) are detected and reported
+//
+// If existingSecret is non-nil, registries already present in the cluster that
+// are not in either OCM source are preserved.
+func BuildPullSecretFromSources(
+	accessTokenAuths map[string]*amv1.AccessTokenAuth,
+	regCreds []*amv1.RegistryCredential,
+	ocm *sdk.Connection,
+	existingSecret []byte,
+	out io.Writer,
+) (*MergeResult, []byte, error) {
+	result := &MergeResult{
+		Auths: make(map[string]MergedAuth),
+	}
+
+	// Start with existing auths if we have them (preserves registries not in OCM)
+	if len(existingSecret) > 0 {
+		var existing struct {
+			Auths map[string]struct {
+				Auth  string `json:"auth"`
+				Email string `json:"email"`
+			} `json:"auths"`
+		}
+		if err := json.Unmarshal(existingSecret, &existing); err == nil {
+			for k, v := range existing.Auths {
+				result.Auths[k] = MergedAuth{
+					Registry: k,
+					Auth:     v.Auth,
+					Email:    v.Email,
+					Source:   SourceExisting,
+				}
+			}
+		}
+	}
+
+	// Layer 1: Access token auths (always applied, overwrites existing)
+	if accessTokenAuths != nil {
+		for k, auth := range accessTokenAuths {
+			result.Auths[k] = MergedAuth{
+				Registry: k,
+				Auth:     auth.Auth(),
+				Email:    auth.Email(),
+				Source:   SourceAccessToken,
+			}
+		}
+	}
+
+	// Layer 2: Registry credential auths (supplementary)
+	for _, cred := range regCreds {
+		token, _ := cred.GetToken()
+		username, _ := cred.GetUsername()
+		if token == "" || username == "" {
+			continue
+		}
+
+		registryID := cred.Registry().ID()
+		regResp, err := ocm.AccountsMgmt().V1().Registries().Registry(registryID).Get().Send()
+		if err != nil {
+			if out != nil {
+				fmt.Fprintf(out, "  %s could not resolve registry %s: %v\n", psColorWarn("[WARN]"), registryID, err)
+			}
+			continue
+		}
+		regName, _ := regResp.Body().GetName()
+		if regName == "" {
+			continue
+		}
+
+		regCredAuth := b64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s", username, token)))
+
+		existing, exists := result.Auths[regName]
+		if exists && existing.Source == SourceAccessToken {
+			// Check for conflict
+			if existing.Auth != regCredAuth {
+				result.Conflicts = append(result.Conflicts, AuthConflict{
+					Registry:       regName,
+					AccessTokenAuth: existing.Auth,
+					RegCredAuth:    regCredAuth,
+				})
+			}
+			// Access token takes precedence — don't overwrite
+			continue
+		}
+
+		if !exists || existing.Source == SourceExisting {
+			result.Auths[regName] = MergedAuth{
+				Registry: regName,
+				Auth:     regCredAuth,
+				Email:    "", // registry credentials use the account email, set by caller
+				Source:   SourceRegistryCredential,
+			}
+			result.Added = append(result.Added, regName)
+		}
+	}
+
+	// Marshal the merged pull secret
+	authsMap := make(map[string]map[string]string)
+	for k, v := range result.Auths {
+		authsMap[k] = map[string]string{
+			"auth":  v.Auth,
+			"email": v.Email,
+		}
+	}
+
+	pullSecret, err := json.Marshal(map[string]map[string]map[string]string{
+		"auths": authsMap,
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to marshal merged pull secret: %w", err)
+	}
+
+	return result, pullSecret, nil
 }

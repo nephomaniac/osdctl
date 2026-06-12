@@ -8,14 +8,16 @@ import (
 	"regexp"
 
 	"github.com/fatih/color"
-	cmv1 "github.com/openshift-online/ocm-sdk-go/clustersmgmt/v1"
+	sdk "github.com/openshift-online/ocm-sdk-go"
 	amv1 "github.com/openshift-online/ocm-sdk-go/accountsmgmt/v1"
+	cmv1 "github.com/openshift-online/ocm-sdk-go/clustersmgmt/v1"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	authorizationv1 "k8s.io/api/authorization/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
 	"k8s.io/client-go/kubernetes"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"go.uber.org/zap/zapcore"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -53,13 +55,15 @@ Required Flags:
 
 Optional Flags:
   -d, --dry-run              Dry-run - show what would change but do not apply
+      --hive-ocm-url string  OCM environment for Hive operations (aliases: production, staging, integration)
 `
 
 type replacePullSecretOptions struct {
-	clusterID string
-	reason    string
-	dryrun    bool
-	logger    *logrus.Logger
+	clusterID  string
+	reason     string
+	dryrun     bool
+	hiveOcmUrl string
+	logger     *logrus.Logger
 
 	genericclioptions.IOStreams
 	GlobalOptions *globalflags.GlobalOptions
@@ -86,6 +90,16 @@ func (d *dryRunChecker) report(ok bool, format string, args ...any) {
 
 func (d *dryRunChecker) info(format string, args ...any) {
 	fmt.Fprintf(d.out, "%s %s\n", colorDryRun("[Dry Run]"), fmt.Sprintf(format, args...))
+}
+
+func (d *dryRunChecker) section(title string, lines ...string) {
+	detail := color.New(color.FgWhite).SprintFunc()
+	fmt.Fprintf(d.out, "\n%s\n", colorDryRun("============================================================"))
+	fmt.Fprintf(d.out, "%s %s\n", colorDryRun("[Dry Run]"), colorDryRun(title))
+	for _, line := range lines {
+		fmt.Fprintf(d.out, "  %s\n", detail(line))
+	}
+	fmt.Fprintf(d.out, "%s\n", colorDryRun("============================================================"))
 }
 
 func newReplacePullSecretLogger() *logrus.Logger {
@@ -143,6 +157,7 @@ https://github.com/openshift/ops-sop/blob/master/v4/howto/transfer_cluster_owner
 	cmd.Flags().StringVarP(&ops.clusterID, "cluster-id", "C", "", "The Internal/External Cluster ID or Cluster Name")
 	cmd.Flags().StringVar(&ops.reason, "reason", "", "The reason for this command (usually an OHSS or PD ticket)")
 	cmd.Flags().BoolVarP(&ops.dryrun, "dry-run", "d", false, "Dry-run - show what would change but do not apply")
+	cmd.Flags().StringVar(&ops.hiveOcmUrl, "hive-ocm-url", "", "OCM environment for Hive operations (aliases: production, staging, integration)")
 
 	_ = cmd.MarkFlagRequired("cluster-id")
 	_ = cmd.MarkFlagRequired("reason")
@@ -159,6 +174,13 @@ func (o *replacePullSecretOptions) validate() error {
 		if !utils.ConfirmPrompt() {
 			return fmt.Errorf("operation aborted — provide a valid --reason")
 		}
+	}
+	if o.hiveOcmUrl != "" {
+		resolved, err := utils.ValidateAndResolveOcmUrl(o.hiveOcmUrl)
+		if err != nil {
+			return fmt.Errorf("invalid --hive-ocm-url: %w", err)
+		}
+		o.hiveOcmUrl = resolved
 	}
 	return nil
 }
@@ -234,84 +256,164 @@ func (o *replacePullSecretOptions) run(ctx context.Context) error {
 
 	// --- Phase 2: Resolve infrastructure clusters ---
 
+	var hiveOCM *sdk.Connection
+	if o.hiveOcmUrl != "" {
+		logger.Infof("Creating separate OCM connection for Hive operations: %s", o.hiveOcmUrl)
+		hiveOCM, err = utils.CreateConnectionWithUrl(o.hiveOcmUrl)
+		if err != nil {
+			if !o.dryrun {
+				return fmt.Errorf("failed to create hive OCM connection with URL '%s': %w", o.hiveOcmUrl, err)
+			}
+			logger.Warnf("Failed to create hive OCM connection: %v", err)
+		} else {
+			defer hiveOCM.Close()
+		}
+	}
+
 	var mgmtCluster *cmv1.Cluster
 	var masterCluster *cmv1.Cluster
+	var infraResolved bool
 
 	if isHCP {
 		logger.Info("Resolving HCP Management and Service clusters")
 		mgmtCluster, err = utils.GetManagementCluster(o.clusterID)
 		if err != nil {
-			return fmt.Errorf("failed to get management cluster: %w", err)
+			if !o.dryrun {
+				return fmt.Errorf("failed to get management cluster: %w", err)
+			}
+			logger.Warnf("Failed to get management cluster: %v", err)
 		}
 		svcCluster, err := utils.GetServiceCluster(o.clusterID)
 		if err != nil {
-			return fmt.Errorf("failed to get service cluster: %w", err)
+			if !o.dryrun {
+				return fmt.Errorf("failed to get service cluster: %w", err)
+			}
+			logger.Warnf("Failed to get service cluster: %v", err)
 		}
-		masterCluster = svcCluster
-		fmt.Fprintf(out, "  Management cluster: %s\n", mgmtCluster.Name())
-		fmt.Fprintf(out, "  Service cluster:    %s\n", svcCluster.Name())
+		if svcCluster != nil {
+			masterCluster = svcCluster
+			infraResolved = true
+			fmt.Fprintf(out, "  Management cluster: %s\n", mgmtCluster.Name())
+			fmt.Fprintf(out, "  Service cluster:    %s\n", svcCluster.Name())
+		}
 	} else {
 		logger.Info("Resolving Hive cluster")
-		hiveCluster, err := utils.GetHiveCluster(o.clusterID)
-		if err != nil {
-			return fmt.Errorf("failed to get hive cluster: %w", err)
+		var hiveCluster *cmv1.Cluster
+		if hiveOCM != nil {
+			hiveCluster, err = utils.GetHiveClusterWithConn(o.clusterID, ocm, hiveOCM)
+		} else {
+			hiveCluster, err = utils.GetHiveCluster(o.clusterID)
 		}
-		masterCluster = hiveCluster
-		fmt.Fprintf(out, "  Hive cluster: %s\n", hiveCluster.Name())
+		if err != nil {
+			if !o.dryrun {
+				return fmt.Errorf("failed to get hive cluster: %w", err)
+			}
+			logger.Warnf("Failed to get hive cluster: %v", err)
+		} else {
+			masterCluster = hiveCluster
+			infraResolved = true
+			fmt.Fprintf(out, "  Hive cluster: %s\n", hiveCluster.Name())
+		}
 	}
 
 	// --- Phase 3: Fetch pull secret from OCM ---
 
 	logger.Infof("Fetching pull secret from OCM for owner '%s'", ownerUsername)
-	pullSecret, auths, err := controller.FetchOwnerPullSecret(ocm, ownerUsername, logger)
+	var pullSecret []byte
+	var auths map[string]*amv1.AccessTokenAuth
+	pullSecret, auths, err = controller.FetchOwnerPullSecret(ocm, ownerUsername, logger)
 	if err != nil {
-		return err
-	}
-	logger.Infof("Retrieved %d auth entries from OCM access token", len(auths))
-
-	missingFromOCM := controller.ValidateRequiredAuths(auths)
-	if len(missingFromOCM) > 0 {
-		logger.Warn("OCM access token is missing required auth entries")
-		for _, m := range missingFromOCM {
-			fmt.Fprintf(out, "  %s missing: %s\n", colorWarn("[WARN]"), m)
+		if !o.dryrun {
+			return err
 		}
-		fmt.Fprintf(out, "This may indicate an issue with the cluster owner's OCM account.\n")
-		fmt.Fprint(out, "Continue with incomplete pull secret? ")
-		if !utils.ConfirmPrompt() {
-			return fmt.Errorf("aborted — OCM access token missing required registries: %v", missingFromOCM)
+		logger.Warnf("Failed to fetch OCM access token: %v", err)
+	} else {
+		logger.Infof("Retrieved %d auth entries from OCM access token", len(auths))
+
+		missingFromOCM := controller.ValidateRequiredAuths(auths)
+		if len(missingFromOCM) > 0 {
+			logger.Warn("OCM access token is missing required auth entries")
+			for _, m := range missingFromOCM {
+				fmt.Fprintf(out, "  %s missing: %s\n", colorWarn("[WARN]"), m)
+			}
+			fmt.Fprintf(out, "This may indicate an issue with the cluster owner's OCM account.\n")
+			if !o.dryrun {
+				fmt.Fprint(out, "Continue with incomplete pull secret? ")
+				if !utils.ConfirmPrompt() {
+					return fmt.Errorf("aborted — OCM access token missing required registries: %v", missingFromOCM)
+				}
+			}
 		}
 	}
 
-	// --- Phase 4: Connect to clusters, RBAC checks, and pre-flight ---
+	// --- Phase 4: Connect to clusters ---
 
 	elevationReasons := []string{
 		o.reason,
 		"Replacing pull secret using osdctl pull-secret update",
 	}
 
-	logger.Infof("Connecting to infrastructure cluster %s (%s)", masterCluster.Name(), masterCluster.ID())
-	masterKubeCli, _, masterKubeClientSet, err := common.GetKubeConfigAndClient(masterCluster.ID(), elevationReasons...)
-	if err != nil {
-		return fmt.Errorf("failed to get kube client for infrastructure cluster %s: %w", masterCluster.ID(), err)
+	var masterKubeCli client.Client
+	var masterKubeClientSet *kubernetes.Clientset
+	var infraConnected bool
+
+	if infraResolved {
+		logger.Infof("Connecting to infrastructure cluster %s (%s)", masterCluster.Name(), masterCluster.ID())
+		if hiveOCM != nil {
+			masterKubeCli, _, masterKubeClientSet, err = common.GetKubeConfigAndClientWithConn(masterCluster.ID(), hiveOCM, elevationReasons...)
+		} else {
+			masterKubeCli, _, masterKubeClientSet, err = common.GetKubeConfigAndClient(masterCluster.ID(), elevationReasons...)
+		}
+		if err != nil {
+			if !o.dryrun {
+				return fmt.Errorf("failed to get kube client for infrastructure cluster %s: %w", masterCluster.ID(), err)
+			}
+			logger.Warnf("Failed to connect to infrastructure cluster: %v", err)
+		} else {
+			infraConnected = true
+		}
 	}
+
+	var targetClientSet *kubernetes.Clientset
+	var targetConnected bool
 
 	logger.Infof("Connecting to target cluster %s (%s)", cluster.Name(), o.clusterID)
-	_, _, targetClientSet, err := common.GetKubeConfigAndClient(o.clusterID, elevationReasons...)
+	_, _, targetClientSet, err = common.GetKubeConfigAndClient(o.clusterID, elevationReasons...)
 	if err != nil {
-		return fmt.Errorf("failed to get kube client for target cluster %s: %w", o.clusterID, err)
+		if !o.dryrun {
+			return fmt.Errorf("failed to get kube client for target cluster %s: %w", o.clusterID, err)
+		}
+		logger.Warnf("Failed to connect to target cluster: %v", err)
+	} else {
+		targetConnected = true
 	}
 
+	// --- Dry-run walkthrough ---
+
 	if o.dryrun {
-		if err := dryRunWalkthrough(ctx, masterKubeClientSet, targetClientSet, isHCP, cluster.Name(), masterCluster.Name(), auths, out); err != nil {
+		mgmtName := ""
+		if mgmtCluster != nil {
+			mgmtName = mgmtCluster.Name()
+		}
+		infraName := "(unresolved)"
+		if masterCluster != nil {
+			infraName = masterCluster.Name()
+		}
+		if err := dryRunWalkthrough(ctx, masterKubeCli, masterKubeClientSet, targetClientSet,
+			isHCP, o.clusterID, cluster.Name(), infraName, mgmtName,
+			auths, out,
+			infraResolved, infraConnected, targetConnected); err != nil {
 			return err
 		}
 		fmt.Fprintf(out, "\n%s Pull secret replacement pre-check completed (no changes made)\n", colorDryRun("[Dry Run]"))
 		return nil
 	}
 
-	if err := controller.PreflightCheck(ctx, targetClientSet, isHCP, cluster.Name(), out); err != nil {
+	preflight, err := controller.PreflightCheck(ctx, targetClientSet, isHCP, cluster.Name(), out)
+	if err != nil {
 		return err
 	}
+	_ = preflight // TODO: use preflight.SecretData for merge logic
 
 	// --- Phase 5: Apply pull secret update ---
 
@@ -385,43 +487,161 @@ func (o *replacePullSecretOptions) run(ctx context.Context) error {
 
 // dryRunWalkthrough walks through every action the live run would perform,
 // interleaving "Would:" statements with RBAC and resource existence checks.
-func dryRunWalkthrough(ctx context.Context, infraClientSet *kubernetes.Clientset, targetClientSet *kubernetes.Clientset, isHCP bool, targetName string, infraName string, auths map[string]*amv1.AccessTokenAuth, out io.Writer) error {
+func dryRunWalkthrough(ctx context.Context, masterKubeCli client.Client, infraClientSet *kubernetes.Clientset, targetClientSet *kubernetes.Clientset, isHCP bool, clusterID string, targetName string, infraName string, mgmtClusterName string, auths map[string]*amv1.AccessTokenAuth, out io.Writer, infraResolved bool, infraConnected bool, targetConnected bool) error {
 	dr := &dryRunChecker{out: out, allOK: true}
-	fmt.Fprintln(out, "")
+
+	// --- Step 1: Summary of OCM data and connectivity ---
+
+	authStatus := fmt.Sprintf("%d auth entries fetched", len(auths))
+	if auths == nil {
+		authStatus = colorFail("[FAIL]") + " could not fetch access token (may require region-lead permissions)"
+		dr.allOK = false
+	}
+
+	infraStatus := colorOK("[OK]") + " connected with elevation"
+	if !infraResolved {
+		infraStatus = colorFail("[FAIL]") + " could not resolve infrastructure cluster"
+		dr.allOK = false
+	} else if !infraConnected {
+		infraStatus = colorFail("[FAIL]") + " could not connect to infrastructure cluster"
+		dr.allOK = false
+	}
+
+	targetStatus := colorOK("[OK]") + " connected with elevation"
+	if !targetConnected {
+		targetStatus = colorFail("[FAIL]") + " could not connect to target cluster"
+		dr.allOK = false
+	}
+
+	dr.section("Step 1: OCM data and cluster connectivity",
+		"Verifies OCM access token can be fetched for the cluster owner and that",
+		"connections can be established to both the infrastructure and target clusters.",
+		"",
+		fmt.Sprintf("  Cluster:              %s (%s)", targetName, clusterID),
+		fmt.Sprintf("  Infrastructure:       %s", infraName),
+		fmt.Sprintf("  OCM access token:     %s", authStatus),
+		fmt.Sprintf("  Infra connection:     %s", infraStatus),
+		fmt.Sprintf("  Target connection:    %s", targetStatus))
+
+	// --- Section 2: Infrastructure cluster pull secret update ---
+
+	// --- Step 2: Infrastructure cluster pull secret update ---
 
 	if isHCP {
-		dr.would("update ManifestWork on service cluster %s to replace pull secret for %s", infraName, targetName)
-		dr.canI(ctx, infraClientSet, "Service cluster", "get", "manifestworks", "work.open-cluster-management.io", "")
-		dr.canI(ctx, infraClientSet, "Service cluster", "update", "manifestworks", "work.open-cluster-management.io", "")
+		dr.section("Step 2: Update pull secret via ManifestWork (HCP)",
+			"HCP clusters store the pull secret inside a ManifestWork on the service cluster.",
+			fmt.Sprintf("The ManifestWork %s/%s will be updated with new auth data.", mgmtClusterName, clusterID),
+			"The work agent then syncs the secret from service cluster → management cluster → hosted cluster.")
+
+		if infraConnected {
+			dr.would("get and update ManifestWork %s/%s on service cluster %s", mgmtClusterName, clusterID, infraName)
+			dr.canI(ctx, infraClientSet, infraName, "get", "manifestworks", "work.open-cluster-management.io", mgmtClusterName)
+			dr.canI(ctx, infraClientSet, infraName, "update", "manifestworks", "work.open-cluster-management.io", mgmtClusterName)
+		} else {
+			dr.would("get and update ManifestWork %s/%s on service cluster %s", mgmtClusterName, clusterID, infraName)
+			fmt.Fprintf(out, "  %s cannot verify — infrastructure cluster not connected\n", colorFail("[SKIP]"))
+		}
 	} else {
-		dr.would("replace secret in Hive namespace on %s and sync to %s via SyncSet", infraName, targetName)
-		dr.canI(ctx, infraClientSet, "Hive cluster", "list", "clusterdeployments", "hive.openshift.io", "")
-		dr.canI(ctx, infraClientSet, "Hive cluster", "delete", "secrets", "", "")
-		dr.canI(ctx, infraClientSet, "Hive cluster", "create", "secrets", "", "")
-		dr.canI(ctx, infraClientSet, "Hive cluster", "create", "syncsets", "hive.openshift.io", "")
-		dr.canI(ctx, infraClientSet, "Hive cluster", "delete", "syncsets", "hive.openshift.io", "")
+		dr.section("Step 2: Update pull secret via Hive SyncSet (Classic)",
+			"Classic clusters store the pull secret in a Hive namespace on the hive cluster.",
+			"The old secret is deleted and recreated, then a SyncSet syncs it to the target cluster.",
+			"After sync completes, the SyncSet is cleaned up.")
+
+		if infraConnected && masterKubeCli != nil {
+			dr.info("Resolving Hive namespace for cluster %s on %s...", clusterID, infraName)
+			hiveInfo, hiveErr := controller.FindHiveNamespace(ctx, masterKubeCli, clusterID)
+			if hiveErr != nil {
+				fmt.Fprintf(out, "  %s could not find Hive namespace: %v\n", colorFail("[FAIL]"), hiveErr)
+				dr.allOK = false
+			} else {
+				hiveNS := hiveInfo.Namespace
+				dr.report(true, "found ClusterDeployment %s/%s on %s", hiveNS, hiveInfo.ClusterDeploymentName, infraName)
+
+				_, secretErr := infraClientSet.CoreV1().Secrets(hiveNS).Get(ctx, "pull", metav1.GetOptions{})
+				if secretErr != nil {
+					dr.report(false, "secret %s/pull not found on %s — will be created", hiveNS, infraName)
+				} else {
+					dr.report(true, "secret %s/pull exists on %s", hiveNS, infraName)
+				}
+
+				dr.would("delete secret %s/pull on %s", hiveNS, infraName)
+				dr.canI(ctx, infraClientSet, infraName, "get", "secrets", "", hiveNS)
+				dr.canI(ctx, infraClientSet, infraName, "delete", "secrets", "", hiveNS)
+
+				dr.would("create secret %s/pull on %s with updated pull secret data", hiveNS, infraName)
+				dr.canI(ctx, infraClientSet, infraName, "create", "secrets", "", hiveNS)
+
+				dr.would("create SyncSet %s/pull-secret-replacement to sync to %s", hiveNS, targetName)
+				dr.canI(ctx, infraClientSet, infraName, "create", "syncsets", "hive.openshift.io", hiveNS)
+
+				dr.would("poll ClusterSync %s/%s then delete SyncSet", hiveNS, hiveInfo.ClusterDeploymentName)
+				dr.canI(ctx, infraClientSet, infraName, "get", "clustersync", "hiveinternal.openshift.io", hiveNS)
+				dr.canI(ctx, infraClientSet, infraName, "delete", "syncsets", "hive.openshift.io", hiveNS)
+			}
+		} else {
+			dr.would("resolve Hive namespace, delete/create secret, create SyncSet on %s", infraName)
+			fmt.Fprintf(out, "  %s cannot verify — infrastructure cluster not connected\n", colorFail("[SKIP]"))
+		}
 	}
+
+	// --- Step 3: Pod rollouts (Classic only) ---
 
 	if !isHCP {
-		dr.would("roll out pods openshift-monitoring/telemeter-client on %s", targetName)
-		dr.canI(ctx, targetClientSet, targetName, "delete", "pods", "", "openshift-monitoring")
+		dr.section("Step 3: Pod rollouts (Classic only)",
+			"After the pull secret is synced, telemeter-client and ocm-agent pods are restarted",
+			"so they pick up the new credentials. HCP clusters do not require pod rollouts.")
+
+		if targetConnected {
+			dr.would("roll out pods openshift-monitoring/telemeter-client on %s", targetName)
+			dr.canI(ctx, targetClientSet, targetName, "delete", "pods", "", "openshift-monitoring")
+
+			dr.would("roll out pods openshift-ocm-agent-operator/ocm-agent on %s", targetName)
+			dr.canI(ctx, targetClientSet, targetName, "delete", "pods", "", "openshift-ocm-agent-operator")
+		} else {
+			dr.would("roll out telemeter-client and ocm-agent pods on %s", targetName)
+			fmt.Fprintf(out, "  %s cannot verify — target cluster not connected\n", colorFail("[SKIP]"))
+		}
 	}
 
-	dr.would("verify secret openshift-config/pull-secret on %s matches OCM access token", targetName)
-	dr.canI(ctx, targetClientSet, targetName, "get", "secrets", "", "openshift-config")
+	// --- Step N: Verification ---
 
-	dr.info("Checking current state of secret openshift-config/pull-secret on %s...", targetName)
-	result, err := controller.VerifyPullSecretAuths(ctx, targetClientSet, auths, out)
-	if err != nil {
-		fmt.Fprintf(out, "  %s current pull secret state: %v\n", colorWarn("[WARN]"), err)
-	} else if result.Matched == result.Total {
-		fmt.Fprintf(out, "  %s Pull secret is already up to date — a live run would be a no-op\n", colorOK("[INFO]"))
-	}
-
+	stepNum := "3"
 	if !isHCP {
-		dr.would("roll out pods openshift-ocm-agent-operator/ocm-agent on %s", targetName)
-		dr.canI(ctx, targetClientSet, targetName, "delete", "pods", "", "openshift-ocm-agent-operator")
+		stepNum = "4"
 	}
+	dr.section(fmt.Sprintf("Step %s: Verify pull secret on target cluster", stepNum),
+		"After update, the pull secret on the target cluster is compared against the OCM",
+		"access token to verify all auth entries match (token + email per registry).",
+		"Required registries are also checked to ensure the cluster can pull images.")
+
+	if targetConnected {
+		dr.canI(ctx, targetClientSet, targetName, "get", "secrets", "", "openshift-config")
+		dr.canI(ctx, targetClientSet, targetName, "update", "secrets", "", "openshift-config")
+
+		if auths != nil {
+			dr.info("Checking current state of secret openshift-config/pull-secret on %s...", targetName)
+			result, err := controller.VerifyPullSecretAuths(ctx, targetClientSet, auths, out)
+			if err != nil {
+				fmt.Fprintf(out, "  %s current pull secret state: %v\n", colorWarn("[WARN]"), err)
+			} else if result.Matched == result.Total {
+				fmt.Fprintf(out, "  %s Pull secret is already up to date — a live run would be a no-op\n", colorOK("[INFO]"))
+			}
+		} else {
+			fmt.Fprintf(out, "  %s cannot compare — OCM access token not available\n", colorFail("[SKIP]"))
+		}
+	} else {
+		fmt.Fprintf(out, "  %s cannot verify — target cluster not connected\n", colorFail("[SKIP]"))
+	}
+
+	// --- Step N+1: Service log ---
+
+	stepNum2 := "4"
+	if !isHCP {
+		stepNum2 = "5"
+	}
+	dr.section(fmt.Sprintf("Step %s: Send internal service log", stepNum2),
+		"An internal (non-customer-visible) service log is sent to record that the",
+		"pull secret was updated, including the owner username and reason.")
 
 	dr.would("send internal service log for %s", targetName)
 

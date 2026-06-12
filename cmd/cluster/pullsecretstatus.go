@@ -274,7 +274,12 @@ func (o *pullSecretSnapshotOptions) run(ctx context.Context) error {
 	fmt.Fprintf(out, "============================================================\n\n")
 
 	staleCount := 0
-	for _, c := range clusters {
+	for i, c := range clusters {
+		if i > 0 {
+			fmt.Fprintln(out)
+			fmt.Fprintln(out, "============================================================")
+			fmt.Fprintln(out)
+		}
 		renderClusterBanner(out, c)
 
 		cr, hasCheck := checkResults[c.ID]
@@ -284,12 +289,10 @@ func (o *pullSecretSnapshotOptions) run(ctx context.Context) error {
 			fmt.Fprintf(out, "  %s PS CHECK: %v\n", colorFail("[FAIL]"), cr.err)
 		} else if hasCheck {
 			if cr.accessTokenResult != nil {
-				fmt.Fprintf(out, "  %s\n", hdr("Access Token Check:"))
-				renderCheckTable(out, cr.accessTokenResult, c.ID)
+				renderCheckTable(out, cr.accessTokenResult, c.ID, "ACCESS TOKEN AUTHS")
 			}
 			if cr.regCredResult != nil {
-				fmt.Fprintf(out, "  %s\n", hdr("Registry Credential Check:"))
-				renderCheckTable(out, cr.regCredResult, c.ID)
+				renderCheckTable(out, cr.regCredResult, c.ID, "REGISTRY CREDENTIAL AUTHS")
 			}
 		} else {
 			renderPSStatus(out, c, latestCredUpdate, &staleCount)
@@ -315,8 +318,8 @@ func (o *pullSecretSnapshotOptions) run(ctx context.Context) error {
 
 func renderClusterBanner(out io.Writer, c controller.ClusterSummary) {
 	label := color.New(color.FgBlue, color.Bold).SprintFunc()
-	fmt.Fprintf(out, "  %s  %s (%s)\n", label("Cluster:"), c.Name, c.ID)
-	fmt.Fprintf(out, "  %s  %s    %s  %s\n",
+	fmt.Fprintf(out, "%s  %s (%s)\n", label("Cluster:"), c.Name, c.ID)
+	fmt.Fprintf(out, "%s  %s    %s  %s\n",
 		label("Created:"), c.CreatedAt.Format("2006-01-02 15:04"),
 		label("Status:"), c.Status)
 }
@@ -335,9 +338,9 @@ func renderPSStatus(out io.Writer, c controller.ClusterSummary, latestCredUpdate
 	}
 }
 
-func renderCheckTable(out io.Writer, result *controller.PullSecretVerifyResult, clusterID string) {
+func renderCheckTable(out io.Writer, result *controller.PullSecretVerifyResult, clusterID string, sourceLabel string) {
 	table := tablewriter.NewWriter(out)
-	table.SetHeader([]string{"REGISTRY", "TOKEN", "EMAIL", "STATUS"})
+	table.SetHeader([]string{sourceLabel, "TOKEN", "EMAIL", "STATUS"})
 	table.SetHeaderAlignment(tablewriter.ALIGN_LEFT)
 	table.SetAlignment(tablewriter.ALIGN_LEFT)
 	table.SetBorder(false)
