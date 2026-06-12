@@ -354,12 +354,13 @@ func renderCheckTable(out io.Writer, result *controller.PullSecretVerifyResult, 
 		tablewriter.Colors{tablewriter.Bold, tablewriter.FgBlueColor},
 	)
 
+	mismatchStatus := color.New(color.FgYellow, color.Bold).SprintFunc()
 	for _, ar := range result.AuthResults {
 		status := colorOK("[OK]")
 		tokenStr := "match"
 		emailStr := "match"
 		if !ar.OK {
-			status = colorFail("[FAIL]")
+			status = mismatchStatus("[!]")
 			if ar.Detail == "not found in cluster secret" {
 				tokenStr = "missing"
 				emailStr = "missing"

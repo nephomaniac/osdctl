@@ -188,11 +188,12 @@ func VerifyPullSecretAuths(ctx context.Context, clientset *kubernetes.Clientset,
 
 // RenderVerifyResult writes the verification result in human-readable format.
 func RenderVerifyResult(result *PullSecretVerifyResult, out io.Writer) {
+	mismatchLine := color.New(color.FgYellow, color.Bold).SprintFunc()
 	for _, ar := range result.AuthResults {
 		if ar.OK {
 			fmt.Fprintf(out, "  %s %-40s token=match, email=match (%s)\n", psColorOK("[OK]"), ar.Registry, ar.Email)
 		} else {
-			fmt.Fprintf(out, "  %s %-40s %s\n", psColorFail("[FAIL]"), ar.Registry, ar.Detail)
+			fmt.Fprintf(out, "  %s\n", mismatchLine(fmt.Sprintf("[!] %-40s %s", ar.Registry, ar.Detail)))
 		}
 	}
 

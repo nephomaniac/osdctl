@@ -32,6 +32,9 @@ type PullSecretOp struct {
 	Out                io.Writer
 	AllOK              bool
 	PullSecretUpToDate bool
+	PullSecretUpdated  bool
+	AuthDiffCount      int
+	Failures           []string
 }
 
 // NewPullSecretOp creates a new operation context.
@@ -69,12 +72,14 @@ func (op *PullSecretOp) OK(format string, args ...any) {
 
 // Fail prints a failure result and marks the operation as not-all-OK.
 func (op *PullSecretOp) Fail(format string, args ...any) {
+	msg := fmt.Sprintf(format, args...)
 	prefix := ""
 	if op.DryRun {
 		prefix = opColorDryRun("[Dry Run] ")
 	}
-	fmt.Fprintf(op.Out, "%s%s %s\n", prefix, opColorFail("[FAIL]"), fmt.Sprintf(format, args...))
+	fmt.Fprintf(op.Out, "%s%s %s\n", prefix, opColorFail("[FAIL]"), msg)
 	op.AllOK = false
+	op.Failures = append(op.Failures, msg)
 }
 
 // Warn prints a warning.

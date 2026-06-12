@@ -162,6 +162,46 @@ func updatePullSecret(conn *sdk.Connection, kubeCli client.Client, clientset *ku
 
 }
 
+// updatePullSecretInNamespace updates the pull secret in the given hive namespace
+// using update-in-place (never deletes). If the secret doesn't exist, it creates it.
+// This avoids the race condition window in the original delete+create approach.
+func updatePullSecretInNamespace(kubeCli client.Client, clientset *kubernetes.Clientset, hiveNamespace string, cdName string, pullsecret []byte) error {
+	secretName := "pull"
+	ctx := context.TODO()
+
+	existing, err := clientset.CoreV1().Secrets(hiveNamespace).Get(ctx, secretName, metav1.GetOptions{})
+	if err != nil {
+		// Secret doesn't exist — create it
+		secret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      secretName,
+				Namespace: hiveNamespace,
+			},
+			Type: corev1.SecretTypeDockerConfigJson,
+			Data: map[string][]byte{
+				".dockerconfigjson": pullsecret,
+			},
+		}
+		_, createErr := clientset.CoreV1().Secrets(hiveNamespace).Create(ctx, secret, metav1.CreateOptions{})
+		if createErr != nil {
+			return fmt.Errorf("failed to create secret %s/%s: %w", hiveNamespace, secretName, createErr)
+		}
+	} else {
+		// Secret exists — update in place
+		existing.Data[".dockerconfigjson"] = pullsecret
+		_, updateErr := clientset.CoreV1().Secrets(hiveNamespace).Update(ctx, existing, metav1.UpdateOptions{})
+		if updateErr != nil {
+			return fmt.Errorf("failed to update secret %s/%s: %w", hiveNamespace, secretName, updateErr)
+		}
+	}
+
+	if err := awaitPullSecretSyncSet(hiveNamespace, cdName, kubeCli); err != nil {
+		return fmt.Errorf("failed to synchronize pull secret for namespace '%s': %w", hiveNamespace, err)
+	}
+
+	return nil
+}
+
 func awaitPullSecretSyncSet(hiveNamespace string, cdName string, kubeCli client.Client) error {
 	ctx := context.TODO()
 

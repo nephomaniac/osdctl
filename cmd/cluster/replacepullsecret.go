@@ -3,6 +3,7 @@ package cluster
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"regexp"
 
@@ -271,6 +272,9 @@ func (o *replacePullSecretOptions) run(ctx context.Context) error {
 		}
 		if err != nil {
 			op.Fail("could not resolve hive cluster: %v", err)
+			if o.hiveOcmUrl == "" {
+				op.Info("Hint: if the hive cluster is in a different OCM environment, try --hive-ocm-url (e.g. --hive-ocm-url prod)")
+			}
 		} else {
 			masterCluster = hiveCluster
 			op.OK("hive cluster: %s", hiveCluster.Name())
@@ -316,8 +320,132 @@ func (o *replacePullSecretOptions) run(ctx context.Context) error {
 	}
 
 	// ================================================================
-	// Step 2: Update pull secret on infrastructure cluster
+	// Pre-flight checks (live mode only — dry-run shows checks inline)
 	// ================================================================
+
+	if !o.dryrun {
+		fmt.Fprintf(out, "\nRunning pre-flight checks...\n")
+		preflightOp := controller.NewPullSecretOp(true, logger, io.Discard)
+
+		// Check infra connectivity
+		if masterCluster == nil || masterKubeCli == nil || masterKubeClientSet == nil {
+			preflightOp.Fail("infrastructure cluster not connected")
+		}
+		// Check target connectivity
+		if targetClientSet == nil {
+			preflightOp.Fail("target cluster not connected")
+		}
+		// Check auths available
+		if auths == nil {
+			preflightOp.Fail("OCM access token not available")
+		}
+		// Check target cluster RBAC
+		if targetClientSet != nil {
+			if !preflightOp.CheckCanI(ctx, targetClientSet, cluster.Name(), "get", "secrets", "", "openshift-config") {
+				preflightOp.Fail("cannot read secrets in openshift-config on %s", cluster.Name())
+			}
+		}
+		// Check infra cluster RBAC
+		if masterKubeClientSet != nil && masterKubeCli != nil && !isHCP {
+			infraLabel := "(infra)"
+			if masterCluster != nil {
+				infraLabel = masterCluster.Name()
+			}
+			hiveInfo, hiveErr := controller.FindHiveNamespace(ctx, masterKubeCli, o.clusterID)
+			if hiveErr != nil || hiveInfo == nil {
+				preflightOp.Fail("could not resolve hive namespace")
+			} else {
+				if !preflightOp.CheckCanI(ctx, masterKubeClientSet, infraLabel, "update", "secrets", "", hiveInfo.Namespace) {
+					preflightOp.Fail("cannot update secrets in %s", hiveInfo.Namespace)
+				}
+				if !preflightOp.CheckCanI(ctx, masterKubeClientSet, infraLabel, "create", "syncsets", "hive.openshift.io", hiveInfo.Namespace) {
+					preflightOp.Fail("cannot create syncsets in %s", hiveInfo.Namespace)
+				}
+			}
+		} else if masterKubeClientSet != nil && isHCP {
+			infraLabel := "(infra)"
+			if masterCluster != nil {
+				infraLabel = masterCluster.Name()
+			}
+			mgmtNS := ""
+			if mgmtCluster != nil {
+				mgmtNS = mgmtCluster.Name()
+			}
+			if !preflightOp.CheckCanI(ctx, masterKubeClientSet, infraLabel, "get", "manifestworks", "work.open-cluster-management.io", mgmtNS) {
+				preflightOp.Fail("cannot get manifestworks on %s", infraLabel)
+			}
+			if !preflightOp.CheckCanI(ctx, masterKubeClientSet, infraLabel, "update", "manifestworks", "work.open-cluster-management.io", mgmtNS) {
+				preflightOp.Fail("cannot update manifestworks on %s", infraLabel)
+			}
+		}
+
+		if !preflightOp.AllOK {
+			fmt.Fprintf(out, "%s Pre-flight checks failed.\n", colorFail("[FAIL]"))
+			for _, f := range preflightOp.Failures {
+				fmt.Fprintf(out, "  %s %s\n", colorFail("[FAIL]"), f)
+			}
+			if !o.force {
+				return fmt.Errorf("pre-flight checks failed")
+			}
+			fmt.Fprintf(out, "\n%s --force specified. Proceeding despite failures.\n", colorWarn("[WARN]"))
+			fmt.Fprintf(out, "Type YES to confirm: ")
+			var response string
+			if _, scanErr := fmt.Scanln(&response); scanErr != nil || response != "YES" {
+				return fmt.Errorf("operation aborted by user")
+			}
+		} else {
+			fmt.Fprintf(out, "%s Pre-flight checks passed.\n", colorOK("[OK]"))
+		}
+	}
+
+	// ================================================================
+	// Step 2: Compare current pull secret against OCM (live mode only)
+	// ================================================================
+
+	if !o.dryrun {
+		atLabel := color.New(color.FgBlue, color.Bold).SprintFunc()
+		rcLabel := color.New(color.FgBlue, color.Bold).SprintFunc()
+
+		op.Section(2, "Compare current pull secret against OCM",
+			"Before making changes, compare the cluster's current pull secret",
+			"against the OCM access token and registry credential auths.")
+
+		if targetClientSet != nil && auths != nil {
+			op.Info("Comparing %s against openshift-config/pull-secret on %s...", atLabel("ACCESS TOKEN"), cluster.Name())
+			atResult, verifyErr := controller.VerifyPullSecretAuths(ctx, targetClientSet, auths, out)
+			if verifyErr != nil {
+				op.Warn("%s verification: %v", atLabel("ACCESS TOKEN"), verifyErr)
+			} else if atResult.Matched == atResult.Total {
+				op.OK("all %d %s auth entries match", atResult.Total, atLabel("ACCESS TOKEN"))
+			} else {
+				op.Warn("%d/%d %s auth entries differ — will be updated", len(atResult.Mismatches), atResult.Total, atLabel("ACCESS TOKEN"))
+			}
+
+			op.Info("Comparing %s against openshift-config/pull-secret on %s...", rcLabel("REGISTRY CREDENTIAL"), cluster.Name())
+			rcResult, rcErr := controller.VerifyRegistryCredentials(ctx, ocm, targetClientSet, ownerAccountID, ownerAccount.Email(), out)
+			if rcErr != nil {
+				op.Warn("%s verification: %v", rcLabel("REGISTRY CREDENTIAL"), rcErr)
+			} else if rcResult.Matched == rcResult.Total {
+				op.OK("all %d %s auth entries match", rcResult.Total, rcLabel("REGISTRY CREDENTIAL"))
+			} else {
+				op.Warn("%d/%d %s auth entries differ — will be updated", len(rcResult.Mismatches), rcResult.Total, rcLabel("REGISTRY CREDENTIAL"))
+			}
+		}
+
+		fmt.Fprint(out, "\nProceed with pull secret update? ")
+		if !utils.ConfirmPrompt() {
+			return fmt.Errorf("operation aborted by user")
+		}
+	}
+
+	// ================================================================
+	// Step N: Update pull secret on infrastructure cluster
+	// ================================================================
+
+	step := 2
+	if !o.dryrun {
+		step = 3
+	}
 
 	infraName := "(unresolved)"
 	if masterCluster != nil {
@@ -335,7 +463,7 @@ func (o *replacePullSecretOptions) run(ctx context.Context) error {
 		//   3. additional-pull-secret (kube-system) — optional customer-added registries, not affected
 		// This tool operates at level 1. Customer-added registries (level 3) are preserved.
 		// Verification reads openshift-config/pull-secret which reflects level 1.
-		op.Section(2, "Update pull secret via ManifestWork (HCP)",
+		op.Section(step, "Update pull secret via ManifestWork (HCP)",
 			"HCP clusters have a multi-layer pull secret architecture:",
 			"  1. HostedCluster.spec.pullSecret (management cluster) — source of truth",
 			"  2. original-pull-secret (kube-system on hosted cluster) — HCCO syncs from #1",
@@ -361,9 +489,10 @@ func (o *replacePullSecretOptions) run(ctx context.Context) error {
 				return fmt.Errorf("failed to update pull secret via ManifestWork: %w", err)
 			}
 			op.OK("ManifestWork updated successfully")
+			op.PullSecretUpdated = true
 		}
 	} else {
-		op.Section(2, "Update pull secret via Hive SyncSet (Classic)",
+		op.Section(step, "Update pull secret via Hive SyncSet (Classic)",
 			"Classic clusters store the pull secret in a Hive namespace on the hive cluster.",
 			"The secret is updated (or created if missing), then a SyncSet syncs it to the target cluster.",
 			"After sync completes, the SyncSet is cleaned up.",
@@ -371,15 +500,18 @@ func (o *replacePullSecretOptions) run(ctx context.Context) error {
 			"Note: The hive secret is never deleted. If missing, it can be restored from the",
 			"target cluster's pull secret or rebuilt from OCM auths.")
 
+		var resolvedHiveNS string
+		var resolvedCDName string
+
 		if masterKubeCli != nil && masterKubeClientSet != nil {
 			hiveInfo, found := op.FindHiveNamespaceOp(ctx, masterKubeCli, o.clusterID, infraName)
 			if found {
-				hiveNS := hiveInfo.Namespace
-				hiveSecretExists := op.CheckSecretExists(ctx, masterKubeClientSet, hiveNS, "pull", infraName)
+				resolvedHiveNS = hiveInfo.Namespace
+				resolvedCDName = hiveInfo.ClusterDeploymentName
+				hiveSecretExists := op.CheckSecretExists(ctx, masterKubeClientSet, resolvedHiveNS, "pull", infraName)
 
 				if !hiveSecretExists {
-					// Hive secret missing — check if target cluster has one we can use as base
-					existingData, source := op.ResolveExistingPullSecret(ctx, masterKubeClientSet, targetClientSet, hiveNS, infraName, cluster.Name())
+					existingData, source := op.ResolveExistingPullSecret(ctx, masterKubeClientSet, targetClientSet, resolvedHiveNS, infraName, cluster.Name())
 					if existingData != nil && source != "" {
 						fmt.Fprintf(out, "\n  The target cluster's pull secret may contain additional auths not available in OCM.\n")
 						fmt.Fprintf(out, "  Use the target cluster's pull secret as the base for restoring the hive secret?\n")
@@ -396,37 +528,40 @@ func (o *replacePullSecretOptions) run(ctx context.Context) error {
 					}
 				}
 
-				op.Would("update or create secret %s/pull on %s with merged pull secret data", hiveNS, infraName)
-				op.CheckCanI(ctx, masterKubeClientSet, infraName, "get", "secrets", "", hiveNS)
-				op.CheckCanI(ctx, masterKubeClientSet, infraName, "update", "secrets", "", hiveNS)
-				op.CheckCanI(ctx, masterKubeClientSet, infraName, "create", "secrets", "", hiveNS)
+				op.Would("update or create secret %s/pull on %s with merged pull secret data", resolvedHiveNS, infraName)
+				op.CheckCanI(ctx, masterKubeClientSet, infraName, "get", "secrets", "", resolvedHiveNS)
+				op.CheckCanI(ctx, masterKubeClientSet, infraName, "update", "secrets", "", resolvedHiveNS)
+				op.CheckCanI(ctx, masterKubeClientSet, infraName, "create", "secrets", "", resolvedHiveNS)
 
-				op.Would("create SyncSet %s/pull-secret-replacement to sync to %s", hiveNS, cluster.Name())
-				op.CheckCanI(ctx, masterKubeClientSet, infraName, "create", "syncsets", "hive.openshift.io", hiveNS)
+				op.Would("create SyncSet %s/pull-secret-replacement to sync to %s", resolvedHiveNS, cluster.Name())
+				op.CheckCanI(ctx, masterKubeClientSet, infraName, "create", "syncsets", "hive.openshift.io", resolvedHiveNS)
 
-				op.Would("poll ClusterSync %s/%s then delete SyncSet", hiveNS, hiveInfo.ClusterDeploymentName)
-				op.CheckCanI(ctx, masterKubeClientSet, infraName, "get", "clustersync", "hiveinternal.openshift.io", hiveNS)
-				op.CheckCanI(ctx, masterKubeClientSet, infraName, "delete", "syncsets", "hive.openshift.io", hiveNS)
+				op.Would("poll ClusterSync %s/%s then delete SyncSet", resolvedHiveNS, resolvedCDName)
+				op.CheckCanI(ctx, masterKubeClientSet, infraName, "get", "clustersync", "hiveinternal.openshift.io", resolvedHiveNS)
+				op.CheckCanI(ctx, masterKubeClientSet, infraName, "delete", "syncsets", "hive.openshift.io", resolvedHiveNS)
 			}
 		} else {
 			op.Would("resolve Hive namespace, update secret, create SyncSet on %s", infraName)
 			op.Fail("cannot verify — infrastructure cluster not connected")
 		}
 
-		if !o.dryrun && op.AllOK {
-			err = updatePullSecret(ocm, masterKubeCli, masterKubeClientSet, o.clusterID, pullSecret)
+		if !o.dryrun && op.AllOK && resolvedHiveNS != "" {
+			// Use the resolved namespace instead of letting updatePullSecret re-discover it
+			op.Info("Updating pull secret in %s/pull on %s", resolvedHiveNS, infraName)
+			err = updatePullSecretInNamespace(masterKubeCli, masterKubeClientSet, resolvedHiveNS, resolvedCDName, pullSecret)
 			if err != nil {
 				return fmt.Errorf("failed to update pull secret via Hive SyncSet: %w", err)
 			}
 			op.OK("pull secret updated via Hive SyncSet")
+			op.PullSecretUpdated = true
 		}
 	}
 
 	// ================================================================
-	// Step 3: Pod rollouts (Classic only)
+	// Pod rollouts (Classic only)
 	// ================================================================
 
-	step := 3
+	step++
 	if !isHCP {
 		op.Section(step, "Pod rollouts (Classic only)",
 			"After the pull secret is synced, telemeter-client and ocm-agent pods are restarted",
@@ -476,7 +611,9 @@ func (o *replacePullSecretOptions) run(ctx context.Context) error {
 				op.OK("all %d %s auth entries match", atResult.Total, atLabel("ACCESS TOKEN"))
 				atAllMatch = true
 			} else {
-				op.Warn("%d/%d %s auth entries differ", len(atResult.Mismatches), atResult.Total, atLabel("ACCESS TOKEN"))
+				diffCount := len(atResult.Mismatches)
+				op.AuthDiffCount += diffCount
+				op.Warn("%d/%d %s auth entries differ", diffCount, atResult.Total, atLabel("ACCESS TOKEN"))
 			}
 		} else {
 			op.Fail("cannot compare %s auths — OCM access token not available", atLabel("ACCESS TOKEN"))
@@ -492,7 +629,9 @@ func (o *replacePullSecretOptions) run(ctx context.Context) error {
 			op.OK("all %d %s auth entries match", rcResult.Total, rcLabel("REGISTRY CREDENTIAL"))
 			rcAllMatch = true
 		} else {
-			op.Warn("%d/%d %s auth entries differ", len(rcResult.Mismatches), rcResult.Total, rcLabel("REGISTRY CREDENTIAL"))
+			diffCount := len(rcResult.Mismatches)
+			op.AuthDiffCount += diffCount
+			op.Warn("%d/%d %s auth entries differ", diffCount, rcResult.Total, rcLabel("REGISTRY CREDENTIAL"))
 		}
 
 		if atAllMatch && rcAllMatch {
@@ -517,11 +656,11 @@ func (o *replacePullSecretOptions) run(ctx context.Context) error {
 	}
 
 	// No-op check — exit before service log if nothing needs updating
+	// Skip if we already performed an update (verification will show all-match post-update)
 	noopLabel := color.New(color.FgBlue, color.Bold).SprintFunc()
-	if op.PullSecretUpToDate && !o.dryrun {
+	if op.PullSecretUpToDate && !o.dryrun && !op.PullSecretUpdated {
 		if !o.force {
 			op.OK("All %s and %s auths match — nothing to update", noopLabel("ACCESS TOKEN"), noopLabel("REGISTRY CREDENTIAL"))
-			op.Info("Use --force to re-apply anyway.")
 			return nil
 		}
 		op.Warn("--force specified — proceeding with update despite no changes needed")
@@ -564,34 +703,75 @@ func (o *replacePullSecretOptions) run(ctx context.Context) error {
 	// Summary
 	// ================================================================
 
+	// ================================================================
+	// Result
+	// ================================================================
+
+	prefix := ""
 	if o.dryrun {
-		if op.AllOK {
-			fmt.Fprintf(out, "\n%s %s All pre-flight checks passed. No changes were made.\n", colorDryRun("[Dry Run]"), colorOK("OK"))
-			if op.PullSecretUpToDate {
-				noopLabel := color.New(color.FgBlue, color.Bold).SprintFunc()
-				fmt.Fprintf(out, "%s %s All %s and %s auths match — a live run would be a no-op.\n",
-					colorDryRun("[Dry Run]"), colorOK("OK"), noopLabel("ACCESS TOKEN"), noopLabel("REGISTRY CREDENTIAL"))
-			}
-		} else {
-			fmt.Fprintf(out, "\n%s %s Some checks failed. Use --force to proceed despite errors.\n", colorDryRun("[Dry Run]"), colorFail("[FAIL]"))
-		}
-		return nil
+		prefix = colorDryRun("[Dry Run] ")
 	}
 
-	if !op.AllOK {
-		if !o.force {
-			fmt.Fprintf(out, "\n%s Pre-flight checks failed. Use --force to proceed despite errors.\n", colorFail("[FAIL]"))
-			return fmt.Errorf("pre-flight checks failed — use --force to override")
-		}
-		fmt.Fprintf(out, "\n%s --force specified. Some checks had failures.\n", colorWarn("[WARN]"))
-		fmt.Fprintf(out, "Proceeding may result in errors or incomplete updates.\n")
-		fmt.Fprintf(out, "Type YES to confirm you want to proceed: ")
-		var response string
-		if _, err := fmt.Scanln(&response); err != nil || response != "YES" {
-			return fmt.Errorf("operation aborted by user")
+	hdrColor := color.New(color.FgBlue, color.Bold).SprintFunc()
+	fmt.Fprintf(out, "\n%s\n", hdrColor("============================================================"))
+	fmt.Fprintf(out, "%s%s\n", prefix, hdrColor("Result"))
+	fmt.Fprintf(out, "%s\n", hdrColor("============================================================"))
+
+	if op.AllOK {
+		if op.PullSecretUpdated {
+			// We performed an update — report success
+			noopLabel := color.New(color.FgBlue, color.Bold).SprintFunc()
+			fmt.Fprintf(out, "%s%s Pull secret updated successfully. All %s and %s auths now match.\n",
+				prefix, colorOK("[OK]"), noopLabel("ACCESS TOKEN"), noopLabel("REGISTRY CREDENTIAL"))
+		} else if op.PullSecretUpToDate && o.dryrun {
+			noopLabel := color.New(color.FgBlue, color.Bold).SprintFunc()
+			fmt.Fprintf(out, "%s%s All %s and %s auths match — a live run would be a no-op.\n",
+				prefix, colorOK("[OK]"), noopLabel("ACCESS TOKEN"), noopLabel("REGISTRY CREDENTIAL"))
+		} else if op.PullSecretUpToDate && !o.dryrun {
+			noopLabel := color.New(color.FgBlue, color.Bold).SprintFunc()
+			fmt.Fprintf(out, "%s%s All %s and %s auths match — nothing to update.\n",
+				prefix, colorOK("[OK]"), noopLabel("ACCESS TOKEN"), noopLabel("REGISTRY CREDENTIAL"))
+			if !o.force {
+				return nil
+			}
+			op.Warn("--force specified — proceeding with update despite no changes needed")
+			fmt.Fprintf(out, "Type YES to confirm: ")
+			var response string
+			if _, scanErr := fmt.Scanln(&response); scanErr != nil || response != "YES" {
+				return fmt.Errorf("operation aborted by user")
+			}
+		} else if op.AuthDiffCount > 0 && o.dryrun {
+			entry := "entry differs"
+			if op.AuthDiffCount > 1 {
+				entry = "entries differ"
+			}
+			fmt.Fprintf(out, "%s%s All pre-flight checks passed. No changes were made.\n", prefix, colorOK("[OK]"))
+			fmt.Fprintf(out, "%s%s %d auth %s and will be updated on a live run.\n",
+				prefix, colorWarn("[NOTE]"), op.AuthDiffCount, entry)
+		} else if o.dryrun {
+			fmt.Fprintf(out, "%s%s All pre-flight checks passed. No changes were made.\n", prefix, colorOK("[OK]"))
+		} else {
+			fmt.Fprintf(out, "%s%s Pull secret update completed successfully.\n", prefix, colorOK("[OK]"))
 		}
 	} else {
-		fmt.Fprintf(out, "\n%s Pull secret update completed successfully\n", colorOK("[OK]"))
+		fmt.Fprintf(out, "%s%s Some checks failed.\n", prefix, colorFail("[FAIL]"))
+		if len(op.Failures) > 0 {
+			fmt.Fprintf(out, "\nFailures:\n")
+			for _, f := range op.Failures {
+				fmt.Fprintf(out, "  %s %s\n", colorFail("[FAIL]"), f)
+			}
+		}
+		if !o.dryrun {
+			if !o.force {
+				return fmt.Errorf("pre-flight checks failed")
+			}
+			fmt.Fprintf(out, "\n%s --force specified. Proceeding despite failures.\n", colorWarn("[WARN]"))
+			fmt.Fprintf(out, "Type YES to confirm: ")
+			var response string
+			if _, scanErr := fmt.Scanln(&response); scanErr != nil || response != "YES" {
+				return fmt.Errorf("operation aborted by user")
+			}
+		}
 	}
 
 	return nil
