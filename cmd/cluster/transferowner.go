@@ -309,6 +309,12 @@ func verifyClusterPullSecret(clientset *kubernetes.Clientset, expectedPullSecret
 	return nil
 }
 
+// updateManifestWork updates the pull secret within a ManifestWork on the service cluster.
+// This operates at level 1 of the HCP pull secret architecture (HostedCluster.spec.pullSecret).
+// HCCO on the hosted cluster reconciles the change to kube-system/original-pull-secret.
+// Customer-added registries in kube-system/additional-pull-secret are not affected.
+// Ref: https://access.redhat.com/solutions/7118834
+// Ref: https://hypershift.pages.dev/how-to/powervs/global-pull-secret/
 func updateManifestWork(conn *sdk.Connection, kubeCli client.Client, clusterID, mgmtClusterName string, pullsecret []byte) error {
 
 	if err := workv1.AddToScheme(kubeCli.Scheme()); err != nil {

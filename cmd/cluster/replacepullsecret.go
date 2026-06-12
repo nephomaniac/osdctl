@@ -329,10 +329,22 @@ func (o *replacePullSecretOptions) run(ctx context.Context) error {
 		if mgmtCluster != nil {
 			mgmtName = mgmtCluster.Name()
 		}
+		// HCP pull secret architecture (see KCS 7118834, hypershift.pages.dev/how-to/powervs/global-pull-secret/):
+		//   1. HostedCluster.spec.pullSecret (management cluster) — source of truth, updated via ManifestWork
+		//   2. original-pull-secret (kube-system on hosted cluster) — HCCO syncs from #1
+		//   3. additional-pull-secret (kube-system) — optional customer-added registries, not affected
+		// This tool operates at level 1. Customer-added registries (level 3) are preserved.
+		// Verification reads openshift-config/pull-secret which reflects level 1.
 		op.Section(2, "Update pull secret via ManifestWork (HCP)",
-			"HCP clusters store the pull secret inside a ManifestWork on the service cluster.",
-			fmt.Sprintf("The ManifestWork %s/%s will be updated with new auth data.", mgmtName, o.clusterID),
-			"The work agent then syncs the secret from service cluster → management cluster → hosted cluster.")
+			"HCP clusters have a multi-layer pull secret architecture:",
+			"  1. HostedCluster.spec.pullSecret (management cluster) — source of truth",
+			"  2. original-pull-secret (kube-system on hosted cluster) — HCCO syncs from #1",
+			"  3. additional-pull-secret (kube-system) — optional customer-added registries",
+			"",
+			"This tool operates at level 1 by updating the ManifestWork on the service cluster.",
+			"HCCO then reconciles the change to the hosted cluster. Customer-added registries",
+			"in additional-pull-secret (level 3) are not affected by this operation.",
+			fmt.Sprintf("ManifestWork: %s/%s on service cluster %s", mgmtName, o.clusterID, infraName))
 
 		if masterKubeClientSet != nil {
 			op.Would("get and update ManifestWork %s/%s on service cluster %s", mgmtName, o.clusterID, infraName)
@@ -353,18 +365,40 @@ func (o *replacePullSecretOptions) run(ctx context.Context) error {
 	} else {
 		op.Section(2, "Update pull secret via Hive SyncSet (Classic)",
 			"Classic clusters store the pull secret in a Hive namespace on the hive cluster.",
-			"The old secret is deleted and recreated, then a SyncSet syncs it to the target cluster.",
-			"After sync completes, the SyncSet is cleaned up.")
+			"The secret is updated (or created if missing), then a SyncSet syncs it to the target cluster.",
+			"After sync completes, the SyncSet is cleaned up.",
+			"",
+			"Note: The hive secret is never deleted. If missing, it can be restored from the",
+			"target cluster's pull secret or rebuilt from OCM auths.")
 
 		if masterKubeCli != nil && masterKubeClientSet != nil {
 			hiveInfo, found := op.FindHiveNamespaceOp(ctx, masterKubeCli, o.clusterID, infraName)
 			if found {
 				hiveNS := hiveInfo.Namespace
-				op.CheckSecretExists(ctx, masterKubeClientSet, hiveNS, "pull", infraName)
+				hiveSecretExists := op.CheckSecretExists(ctx, masterKubeClientSet, hiveNS, "pull", infraName)
 
-				op.Would("delete and recreate secret %s/pull on %s", hiveNS, infraName)
+				if !hiveSecretExists {
+					// Hive secret missing — check if target cluster has one we can use as base
+					existingData, source := op.ResolveExistingPullSecret(ctx, masterKubeClientSet, targetClientSet, hiveNS, infraName, cluster.Name())
+					if existingData != nil && source != "" {
+						fmt.Fprintf(out, "\n  The target cluster's pull secret may contain additional auths not available in OCM.\n")
+						fmt.Fprintf(out, "  Use the target cluster's pull secret as the base for restoring the hive secret?\n")
+						fmt.Fprintf(out, "    - YES: merge OCM auths into the target cluster's existing pull secret (recommended)\n")
+						fmt.Fprintf(out, "    - NO:  build from OCM auths only (may be missing customer or operator-added auths)\n")
+						fmt.Fprint(out, "  Use target cluster pull secret as base? ")
+						if utils.ConfirmPrompt() {
+							op.Info("Will use %s as base for hive secret restoration", source)
+						} else {
+							op.Info("Will build hive secret from OCM auths only")
+						}
+					} else {
+						op.Warn("no existing pull secret available — will build from OCM auths only (requires --force)")
+					}
+				}
+
+				op.Would("update or create secret %s/pull on %s with merged pull secret data", hiveNS, infraName)
 				op.CheckCanI(ctx, masterKubeClientSet, infraName, "get", "secrets", "", hiveNS)
-				op.CheckCanI(ctx, masterKubeClientSet, infraName, "delete", "secrets", "", hiveNS)
+				op.CheckCanI(ctx, masterKubeClientSet, infraName, "update", "secrets", "", hiveNS)
 				op.CheckCanI(ctx, masterKubeClientSet, infraName, "create", "secrets", "", hiveNS)
 
 				op.Would("create SyncSet %s/pull-secret-replacement to sync to %s", hiveNS, cluster.Name())
@@ -422,23 +456,54 @@ func (o *replacePullSecretOptions) run(ctx context.Context) error {
 	// ================================================================
 
 	op.Section(step, "Verify pull secret on target cluster",
-		"The pull secret on the target cluster is compared against the OCM",
-		"access token to verify all auth entries match (token + email per registry).",
+		"The pull secret on the target cluster is compared against both the OCM",
+		"access token auths and registry credential auths to verify all entries match.",
 		"Required registries are also checked to ensure the cluster can pull images.")
 
 	if targetClientSet != nil {
 		op.CheckCanI(ctx, targetClientSet, cluster.Name(), "get", "secrets", "", "openshift-config")
 
+		var atAllMatch, rcAllMatch bool
+
+		// Access token verification
+		atLabel := color.New(color.FgBlue, color.Bold).SprintFunc()
 		if auths != nil {
-			op.Info("Checking secret openshift-config/pull-secret on %s...", cluster.Name())
-			result, verifyErr := controller.VerifyPullSecretAuths(ctx, targetClientSet, auths, out)
+			op.Info("Comparing %s against openshift-config/pull-secret on %s...", atLabel("ACCESS TOKEN"), cluster.Name())
+			atResult, verifyErr := controller.VerifyPullSecretAuths(ctx, targetClientSet, auths, out)
 			if verifyErr != nil {
-				op.Warn("pull secret verification: %v", verifyErr)
-			} else if result.Matched == result.Total && o.dryrun {
-				op.Info("Pull secret is already up to date — a live run would be a no-op")
+				op.Warn("%s verification: %v", atLabel("ACCESS TOKEN"), verifyErr)
+			} else if atResult.Matched == atResult.Total {
+				op.OK("all %d %s auth entries match", atResult.Total, atLabel("ACCESS TOKEN"))
+				atAllMatch = true
+			} else {
+				op.Warn("%d/%d %s auth entries differ", len(atResult.Mismatches), atResult.Total, atLabel("ACCESS TOKEN"))
 			}
 		} else {
-			op.Fail("cannot compare — OCM access token not available")
+			op.Fail("cannot compare %s auths — OCM access token not available", atLabel("ACCESS TOKEN"))
+		}
+
+		// Registry credential verification
+		rcLabel := color.New(color.FgBlue, color.Bold).SprintFunc()
+		op.Info("Comparing %s against openshift-config/pull-secret on %s...", rcLabel("REGISTRY CREDENTIAL"), cluster.Name())
+		rcResult, rcErr := controller.VerifyRegistryCredentials(ctx, ocm, targetClientSet, ownerAccountID, ownerAccount.Email(), out)
+		if rcErr != nil {
+			op.Warn("%s verification: %v", rcLabel("REGISTRY CREDENTIAL"), rcErr)
+		} else if rcResult.Matched == rcResult.Total {
+			op.OK("all %d %s auth entries match", rcResult.Total, rcLabel("REGISTRY CREDENTIAL"))
+			rcAllMatch = true
+		} else {
+			op.Warn("%d/%d %s auth entries differ", len(rcResult.Mismatches), rcResult.Total, rcLabel("REGISTRY CREDENTIAL"))
+		}
+
+		if atAllMatch && rcAllMatch {
+			op.PullSecretUpToDate = true
+			op.OK("All %s and %s auths match — pull secret is up to date", atLabel("ACCESS TOKEN"), rcLabel("REGISTRY CREDENTIAL"))
+		} else if o.dryrun {
+			if atAllMatch && !rcAllMatch {
+				op.Warn("%s auths match but %s auths differ", atLabel("ACCESS TOKEN"), rcLabel("REGISTRY CREDENTIAL"))
+			} else if !atAllMatch && rcAllMatch {
+				op.Warn("%s auths differ but %s auths match", atLabel("ACCESS TOKEN"), rcLabel("REGISTRY CREDENTIAL"))
+			}
 		}
 	} else {
 		op.Fail("cannot verify — target cluster not connected")
@@ -450,6 +515,22 @@ func (o *replacePullSecretOptions) run(ctx context.Context) error {
 			op.Warn("failed to roll out ocm-agent pods: %v", err)
 		}
 	}
+
+	// No-op check — exit before service log if nothing needs updating
+	noopLabel := color.New(color.FgBlue, color.Bold).SprintFunc()
+	if op.PullSecretUpToDate && !o.dryrun {
+		if !o.force {
+			op.OK("All %s and %s auths match — nothing to update", noopLabel("ACCESS TOKEN"), noopLabel("REGISTRY CREDENTIAL"))
+			op.Info("Use --force to re-apply anyway.")
+			return nil
+		}
+		op.Warn("--force specified — proceeding with update despite no changes needed")
+		fmt.Fprintf(out, "Type YES to confirm: ")
+		var response string
+		if _, scanErr := fmt.Scanln(&response); scanErr != nil || response != "YES" {
+			return fmt.Errorf("operation aborted by user")
+		}
+	}
 	step++
 
 	// ================================================================
@@ -458,7 +539,8 @@ func (o *replacePullSecretOptions) run(ctx context.Context) error {
 
 	op.Section(step, "Send internal service log",
 		"An internal (non-customer-visible) service log is sent to record that the",
-		"pull secret was updated, including the owner username and reason.")
+		"pull secret was updated, including the owner username and reason.",
+		"This step only runs if the pull secret update was performed.")
 
 	op.Would("send internal service log for %s", cluster.Name())
 
@@ -485,6 +567,11 @@ func (o *replacePullSecretOptions) run(ctx context.Context) error {
 	if o.dryrun {
 		if op.AllOK {
 			fmt.Fprintf(out, "\n%s %s All pre-flight checks passed. No changes were made.\n", colorDryRun("[Dry Run]"), colorOK("OK"))
+			if op.PullSecretUpToDate {
+				noopLabel := color.New(color.FgBlue, color.Bold).SprintFunc()
+				fmt.Fprintf(out, "%s %s All %s and %s auths match — a live run would be a no-op.\n",
+					colorDryRun("[Dry Run]"), colorOK("OK"), noopLabel("ACCESS TOKEN"), noopLabel("REGISTRY CREDENTIAL"))
+			}
 		} else {
 			fmt.Fprintf(out, "\n%s %s Some checks failed. Use --force to proceed despite errors.\n", colorDryRun("[Dry Run]"), colorFail("[FAIL]"))
 		}

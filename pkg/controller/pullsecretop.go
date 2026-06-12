@@ -27,10 +27,11 @@ var (
 // PullSecretOp carries context for pull secret operations. Each method
 // checks DryRun and either performs the operation or reports what it would do.
 type PullSecretOp struct {
-	DryRun bool
-	Logger *logrus.Logger
-	Out    io.Writer
-	AllOK  bool
+	DryRun             bool
+	Logger             *logrus.Logger
+	Out                io.Writer
+	AllOK              bool
+	PullSecretUpToDate bool
 }
 
 // NewPullSecretOp creates a new operation context.
@@ -189,6 +190,39 @@ func (op *PullSecretOp) FetchAccessTokenOp(ocm *sdk.Connection, ownerUsername st
 		}
 	}
 	return pullSecret, auths, true
+}
+
+// ResolveExistingPullSecret finds the best available base pull secret data.
+// Tries the hive secret first, then falls back to the target cluster's secret.
+// Returns the secret data bytes and the source description.
+func (op *PullSecretOp) ResolveExistingPullSecret(ctx context.Context, infraClientSet *kubernetes.Clientset, targetClientSet *kubernetes.Clientset, hiveNS string, infraName string, targetName string) ([]byte, string) {
+	// Try hive secret first
+	if infraClientSet != nil {
+		hiveSecret, err := infraClientSet.CoreV1().Secrets(hiveNS).Get(ctx, "pull", metav1.GetOptions{})
+		if err == nil {
+			if data, ok := hiveSecret.Data[".dockerconfigjson"]; ok {
+				op.OK("secret %s/pull found on %s — using as base", hiveNS, infraName)
+				return data, fmt.Sprintf("%s/pull on %s", hiveNS, infraName)
+			}
+		}
+		op.Warn("secret %s/pull not found on %s", hiveNS, infraName)
+	}
+
+	// Hive secret missing — check target cluster
+	if targetClientSet != nil {
+		targetSecret, err := targetClientSet.CoreV1().Secrets("openshift-config").Get(ctx, "pull-secret", metav1.GetOptions{})
+		if err == nil {
+			if data, ok := targetSecret.Data[".dockerconfigjson"]; ok {
+				op.OK("secret openshift-config/pull-secret found on %s (can be used as base)", targetName)
+				return data, fmt.Sprintf("openshift-config/pull-secret on %s", targetName)
+			}
+		}
+		op.Warn("secret openshift-config/pull-secret not found on %s", targetName)
+	}
+
+	// Neither found
+	op.Warn("no existing pull secret found — will need to build from OCM auths only")
+	return nil, ""
 }
 
 func nsLabel(namespace string) string {
