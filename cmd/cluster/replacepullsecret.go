@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	b64 "encoding/base64"
 	"fmt"
 	"io"
 	"os"
@@ -13,6 +14,8 @@ import (
 	cmv1 "github.com/openshift-online/ocm-sdk-go/clustersmgmt/v1"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
 	"k8s.io/client-go/kubernetes"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -119,6 +122,7 @@ https://github.com/openshift/ops-sop/blob/master/v4/howto/transfer_cluster_owner
   osdctl cluster pull-secret update --cluster-id 1kfmyclusterid --reason "OHSS-1234" --force`,
 		Args:              cobra.NoArgs,
 		DisableAutoGenTag: true,
+		SilenceUsage:      true,
 		PreRunE: func(cmd *cobra.Command, args []string) error {
 			return ops.validate()
 		},
@@ -403,32 +407,96 @@ func (o *replacePullSecretOptions) run(ctx context.Context) error {
 	// ================================================================
 
 	if !o.dryrun {
-		atLabel := color.New(color.FgBlue, color.Bold).SprintFunc()
-		rcLabel := color.New(color.FgBlue, color.Bold).SprintFunc()
+		op.Section(2, "Compare pull secret across OCM, Hive, and target cluster",
+			"Before making changes, compare the pull secret across all three sources:",
+			"  OCM    — access token auths (source of truth)",
+			"  Hive   — secret in hive namespace (used by SyncSet)",
+			"  Target — openshift-config/pull-secret (what the cluster uses)",
+			"",
+			"Hive will always be brought in sync with OCM.",
+			"Target will be synced via SyncSet only if it differs from the updated hive secret.")
 
-		op.Section(2, "Compare current pull secret against OCM",
-			"Before making changes, compare the cluster's current pull secret",
-			"against the OCM access token and registry credential auths.")
+		var hiveData, targetData []byte
 
-		if targetClientSet != nil && auths != nil {
-			op.Info("Comparing %s against openshift-config/pull-secret on %s...", atLabel("ACCESS TOKEN"), cluster.Name())
-			atResult, verifyErr := controller.VerifyPullSecretAuths(ctx, targetClientSet, auths, out)
-			if verifyErr != nil {
-				op.Warn("%s verification: %v", atLabel("ACCESS TOKEN"), verifyErr)
-			} else if atResult.Matched == atResult.Total {
-				op.OK("all %d %s auth entries match", atResult.Total, atLabel("ACCESS TOKEN"))
-			} else {
-				op.Warn("%d/%d %s auth entries differ — will be updated", len(atResult.Mismatches), atResult.Total, atLabel("ACCESS TOKEN"))
+		// Read hive secret
+		if masterKubeClientSet != nil && masterKubeCli != nil && !isHCP {
+			hiveInfo, hiveErr := controller.FindHiveNamespace(ctx, masterKubeCli, o.clusterID)
+			if hiveErr == nil {
+				hiveSecret, getErr := masterKubeClientSet.CoreV1().Secrets(hiveInfo.Namespace).Get(ctx, "pull", metav1.GetOptions{})
+				if getErr == nil {
+					hiveData = hiveSecret.Data[".dockerconfigjson"]
+				}
 			}
+		}
 
-			op.Info("Comparing %s against openshift-config/pull-secret on %s...", rcLabel("REGISTRY CREDENTIAL"), cluster.Name())
-			rcResult, rcErr := controller.VerifyRegistryCredentials(ctx, ocm, targetClientSet, ownerAccountID, ownerAccount.Email(), out)
-			if rcErr != nil {
-				op.Warn("%s verification: %v", rcLabel("REGISTRY CREDENTIAL"), rcErr)
-			} else if rcResult.Matched == rcResult.Total {
-				op.OK("all %d %s auth entries match", rcResult.Total, rcLabel("REGISTRY CREDENTIAL"))
-			} else {
-				op.Warn("%d/%d %s auth entries differ — will be updated", len(rcResult.Mismatches), rcResult.Total, rcLabel("REGISTRY CREDENTIAL"))
+		// Read target secret
+		if targetClientSet != nil {
+			targetSecret, getErr := targetClientSet.CoreV1().Secrets("openshift-config").Get(ctx, "pull-secret", metav1.GetOptions{})
+			if getErr == nil {
+				targetData = targetSecret.Data[".dockerconfigjson"]
+			}
+		}
+
+		allInSync := true
+
+		// Access token three-way comparison
+		if auths != nil {
+			atSimple := controller.AccessTokenToSimple(auths)
+			atComparison := controller.CompareThreeWay(atSimple, hiveData, targetData)
+			controller.RenderThreeWayComparison(atComparison, "ACCESS TOKEN AUTHS", out)
+			if !atComparison.AllInSync {
+				allInSync = false
+			}
+		} else {
+			op.Warn("OCM access token not available — cannot compare access token auths")
+			allInSync = false
+		}
+
+		// Registry credential three-way comparison
+		regCreds, regErr := utils.GetRegistryCredentials(ocm, ownerAccountID)
+		if regErr == nil && len(regCreds) > 0 {
+			rcSimple := make(map[string]controller.SimpleAuth)
+			for _, cred := range regCreds {
+				token, _ := cred.GetToken()
+				username, _ := cred.GetUsername()
+				if token == "" || username == "" {
+					continue
+				}
+				registryID := cred.Registry().ID()
+				regResp, err := ocm.AccountsMgmt().V1().Registries().Registry(registryID).Get().Send()
+				if err != nil {
+					continue
+				}
+				regName, _ := regResp.Body().GetName()
+				if regName == "" {
+					continue
+				}
+				rcSimple[regName] = controller.SimpleAuth{
+					Auth:  b64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s", username, token))),
+					Email: ownerAccount.Email(),
+				}
+			}
+			if len(rcSimple) > 0 {
+				rcComparison := controller.CompareThreeWay(rcSimple, hiveData, targetData)
+				controller.RenderThreeWayComparison(rcComparison, "REGISTRY CREDENTIAL AUTHS", out)
+				if !rcComparison.AllInSync {
+					allInSync = false
+				}
+			}
+		} else {
+			op.Warn("Could not fetch registry credentials — skipping registry credential comparison")
+		}
+
+		if allInSync {
+			op.OK("All sources in sync — nothing to update")
+			if !o.force {
+				return nil
+			}
+			op.Warn("--force specified — proceeding despite no changes needed")
+			fmt.Fprintf(out, "Type YES to confirm: ")
+			var response string
+			if _, scanErr := fmt.Scanln(&response); scanErr != nil || response != "YES" {
+				return fmt.Errorf("operation aborted by user")
 			}
 		}
 
@@ -772,6 +840,51 @@ func (o *replacePullSecretOptions) run(ctx context.Context) error {
 				return fmt.Errorf("operation aborted by user")
 			}
 		}
+	}
+
+	return nil
+}
+
+// updatePullSecretInNamespace updates the pull secret in the given hive namespace
+// using update-in-place (never deletes). If the secret doesn't exist, it creates it.
+// When the secret exists, new auths are merged into the existing secret via buildNewSecret,
+// preserving any auths not present in the new data (e.g. customer-added registries).
+// This avoids the race condition window in the original delete+create approach used
+// by transfer-owner (transferowner.go:updatePullSecret).
+func updatePullSecretInNamespace(kubeCli client.Client, clientset *kubernetes.Clientset, hiveNamespace string, cdName string, pullsecret []byte) error {
+	secretName := "pull"
+	ctx := context.TODO()
+
+	existing, err := clientset.CoreV1().Secrets(hiveNamespace).Get(ctx, secretName, metav1.GetOptions{})
+	if err != nil {
+		secret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      secretName,
+				Namespace: hiveNamespace,
+			},
+			Type: corev1.SecretTypeDockerConfigJson,
+			Data: map[string][]byte{
+				".dockerconfigjson": pullsecret,
+			},
+		}
+		_, createErr := clientset.CoreV1().Secrets(hiveNamespace).Create(ctx, secret, metav1.CreateOptions{})
+		if createErr != nil {
+			return fmt.Errorf("failed to create secret %s/%s: %w", hiveNamespace, secretName, createErr)
+		}
+	} else {
+		mergedData, mergeErr := buildNewSecret(existing.Data[".dockerconfigjson"], pullsecret)
+		if mergeErr != nil {
+			return fmt.Errorf("failed to merge pull secret auths for %s/%s: %w", hiveNamespace, secretName, mergeErr)
+		}
+		existing.Data[".dockerconfigjson"] = mergedData
+		_, updateErr := clientset.CoreV1().Secrets(hiveNamespace).Update(ctx, existing, metav1.UpdateOptions{})
+		if updateErr != nil {
+			return fmt.Errorf("failed to update secret %s/%s: %w", hiveNamespace, secretName, updateErr)
+		}
+	}
+
+	if err := awaitPullSecretSyncSet(hiveNamespace, cdName, kubeCli); err != nil {
+		return fmt.Errorf("failed to synchronize pull secret for namespace '%s': %w", hiveNamespace, err)
 	}
 
 	return nil

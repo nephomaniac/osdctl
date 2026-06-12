@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/fatih/color"
+	"github.com/olekukonko/tablewriter"
 	sdk "github.com/openshift-online/ocm-sdk-go"
 	amv1 "github.com/openshift-online/ocm-sdk-go/accountsmgmt/v1"
 	hiveapiv1 "github.com/openshift/hive/apis/hive/v1"
@@ -305,6 +306,170 @@ func VerifyRegistryCredentials(ctx context.Context, ocm *sdk.Connection, clients
 	}
 
 	return result, nil
+}
+
+// ThreeWayAuthState describes the sync state of a single auth entry across OCM, hive, and target.
+type ThreeWayAuthState struct {
+	Registry    string
+	InOCM       bool
+	InHive      bool
+	InTarget    bool
+	OCMMatchesHive   bool
+	OCMMatchesTarget bool
+	HiveMatchesTarget bool
+}
+
+// ThreeWayComparison holds the full comparison result across OCM, hive, and target.
+type ThreeWayComparison struct {
+	Auths            []ThreeWayAuthState
+	HiveNeedsUpdate  bool
+	TargetNeedsSync  bool
+	AllInSync        bool
+}
+
+// SimpleAuth holds a registry auth's token and email for generic comparison.
+type SimpleAuth struct {
+	Auth  string
+	Email string
+}
+
+// AccessTokenToSimple converts access token auths to SimpleAuth map.
+func AccessTokenToSimple(auths map[string]*amv1.AccessTokenAuth) map[string]SimpleAuth {
+	result := make(map[string]SimpleAuth, len(auths))
+	for k, v := range auths {
+		result[k] = SimpleAuth{Auth: v.Auth(), Email: v.Email()}
+	}
+	return result
+}
+
+// CompareThreeWay compares pull secret auths across OCM, hive secret, and target cluster secret.
+// ocmAuths maps registry name → SimpleAuth with the expected auth/email values.
+// hiveData and targetData are the raw .dockerconfigjson bytes from each secret.
+func CompareThreeWay(ocmAuths map[string]SimpleAuth, hiveData []byte, targetData []byte) *ThreeWayComparison {
+	result := &ThreeWayComparison{AllInSync: true}
+
+	type parsedAuth struct {
+		Auth  string `json:"auth"`
+		Email string `json:"email"`
+	}
+	type parsedPS struct {
+		Auths map[string]parsedAuth `json:"auths"`
+	}
+
+	var hive, target parsedPS
+	hiveAuths := make(map[string]parsedAuth)
+	targetAuths := make(map[string]parsedAuth)
+
+	if len(hiveData) > 0 {
+		if err := json.Unmarshal(hiveData, &hive); err == nil {
+			hiveAuths = hive.Auths
+		}
+	}
+	if len(targetData) > 0 {
+		if err := json.Unmarshal(targetData, &target); err == nil {
+			targetAuths = target.Auths
+		}
+	}
+
+	// Only compare registries present in the OCM source being checked.
+	// Registries in hive/target but not in OCM are outside this source's scope.
+	for registry := range ocmAuths {
+		state := ThreeWayAuthState{Registry: registry}
+
+		ocmAuth, inOCM := ocmAuths[registry]
+		hiveAuth, inHive := hiveAuths[registry]
+		targetAuth, inTarget := targetAuths[registry]
+
+		state.InOCM = inOCM
+		state.InHive = inHive
+		state.InTarget = inTarget
+
+		if inOCM && inHive {
+			state.OCMMatchesHive = ocmAuth.Auth == hiveAuth.Auth && ocmAuth.Email == hiveAuth.Email
+		}
+		if inOCM && inTarget {
+			state.OCMMatchesTarget = ocmAuth.Auth == targetAuth.Auth && ocmAuth.Email == targetAuth.Email
+		}
+		if inHive && inTarget {
+			state.HiveMatchesTarget = hiveAuth.Auth == targetAuth.Auth && hiveAuth.Email == targetAuth.Email
+		}
+
+		// Determine if sync is needed
+		if inOCM && !state.OCMMatchesHive {
+			result.HiveNeedsUpdate = true
+			result.AllInSync = false
+		}
+		if inOCM && !state.OCMMatchesTarget {
+			result.TargetNeedsSync = true
+			result.AllInSync = false
+		}
+		if inHive && inTarget && !state.HiveMatchesTarget {
+			result.AllInSync = false
+		}
+
+		result.Auths = append(result.Auths, state)
+	}
+
+	return result
+}
+
+// RenderThreeWayComparison prints the three-way comparison in a readable format.
+// RenderThreeWayComparison prints the three-way comparison in a readable format.
+// sourceLabel identifies the OCM source (e.g. "ACCESS TOKEN AUTHS", "REGISTRY CREDENTIAL AUTHS").
+func RenderThreeWayComparison(result *ThreeWayComparison, sourceLabel string, out io.Writer) {
+	hdr := color.New(color.FgBlue, color.Bold).SprintFunc()
+
+	table := tablewriter.NewWriter(out)
+	table.SetHeader([]string{sourceLabel, "OCM↔HIVE", "OCM↔TARGET", "HIVE↔TARGET"})
+	table.SetHeaderAlignment(tablewriter.ALIGN_LEFT)
+	table.SetAlignment(tablewriter.ALIGN_LEFT)
+	table.SetBorder(false)
+	table.SetColumnSeparator("  ")
+	table.SetAutoWrapText(false)
+	table.SetAutoFormatHeaders(false)
+	table.SetHeaderColor(
+		tablewriter.Colors{tablewriter.Bold, tablewriter.FgBlueColor},
+		tablewriter.Colors{tablewriter.Bold, tablewriter.FgBlueColor},
+		tablewriter.Colors{tablewriter.Bold, tablewriter.FgBlueColor},
+		tablewriter.Colors{tablewriter.Bold, tablewriter.FgBlueColor},
+	)
+	_ = hdr // header color handled by tablewriter
+
+	for _, a := range result.Auths {
+		table.Append([]string{
+			a.Registry,
+			syncStatus(a.InHive, a.OCMMatchesHive),
+			syncStatus(a.InTarget, a.OCMMatchesTarget),
+			syncStatus(a.InHive && a.InTarget, a.HiveMatchesTarget),
+		})
+	}
+	table.Render()
+
+	fmt.Fprintln(out)
+	if result.AllInSync {
+		fmt.Fprintf(out, "  %s All sources in sync\n", psColorOK("[OK]"))
+	} else {
+		if result.HiveNeedsUpdate {
+			fmt.Fprintf(out, "  %s Hive secret needs update from OCM\n", psColorWarn("[!]"))
+		}
+		if result.TargetNeedsSync {
+			fmt.Fprintf(out, "  %s Target cluster needs sync from hive\n", psColorWarn("[!]"))
+		}
+	}
+}
+
+func dim(s string) string {
+	return color.New(color.FgHiBlack).Sprint(s)
+}
+
+func syncStatus(present bool, matches bool) string {
+	if !present {
+		return color.New(color.FgYellow).Sprint("missing")
+	}
+	if matches {
+		return color.New(color.FgGreen).Sprint("match")
+	}
+	return color.New(color.FgYellow, color.Bold).Sprint("DIFFERS")
 }
 
 // HiveNamespaceInfo holds the resolved Hive namespace and ClusterDeployment name
